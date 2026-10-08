@@ -1,0 +1,49 @@
+# Production Credentials & Keys (Never Commit Real Secrets)
+credentials.txt
+*.secret
+*.env
+*.env.*
+*.key
+*.pem
+*.pfx
+*.p12
+id_rsa*
+id_ed25519*
+id_ecdsa*
+
+# Databases and State Snapshots
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+
+# Runtime and Log Files
+*.log
+*.pid
+nohup.out
+
+# Python Caches & Environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Operating System Metadata
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Editor and IDE Files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
