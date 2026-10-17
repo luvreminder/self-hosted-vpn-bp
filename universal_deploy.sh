@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_SWAP=false
 SKIP_WARP=false
 CHECK_ONLY=false
+KEEP_ICMP=false
 SUB_PORTS="${SUB_PORTS:-2096,28443}"
 
 show_help() {
@@ -22,6 +23,7 @@ Options:
   -c, --check       Run environment and hardware compatibility checks without modifying the system.
   --skip-swap       Skip automatic 2 GB swapfile allocation.
   --skip-warp       Skip Cloudflare WARP SOCKS5 client deployment.
+  --keep-icmp       Keep standard ICMP echo responses active (Stack Mimicry against ML/behavioral DPI).
   --sub-ports PORTS Custom comma-separated subscription gateway ports (default: 2096,28443).
 
 Documentation: README.md
@@ -45,6 +47,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-warp)
             SKIP_WARP=true
+            shift
+            ;;
+        --keep-icmp)
+            KEEP_ICMP=true
             shift
             ;;
         --sub-ports)
@@ -170,27 +176,33 @@ case "$OS_ID" in
         ;;
 esac
 
-# 7. Kernel performance tuning (TCP BBR + ICMP Blackhole)
-echo "⚡ Configuring kernel: Enabling TCP BBR and ICMP Echo Blackhole..."
+# 7. Kernel performance tuning (TCP BBR + Optional ICMP Blackhole)
+echo "⚡ Configuring kernel: Enabling TCP BBR congestion control..."
 sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
 sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
 sed -i '/net.ipv4.icmp_echo_ignore_all/d' /etc/sysctl.conf
 
 echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
 echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-echo "net.ipv4.icmp_echo_ignore_all=1" >> /etc/sysctl.conf
+if [ "$KEEP_ICMP" = false ]; then
+    echo "net.ipv4.icmp_echo_ignore_all=1" >> /etc/sysctl.conf
+else
+    echo "net.ipv4.icmp_echo_ignore_all=0" >> /etc/sysctl.conf
+fi
 sysctl -p
 
 # 8. Host protection against BitTorrent (Layer-7 Anti-DMCA)
 # Note: Xray proxy traffic is filtered inside Xray Core via "protocol": ["bittorrent"] -> blackhole.
-# The following iptables rules provide kernel defense-in-depth for host processes.
+# The following iptables rules provide idempotent kernel defense-in-depth for host processes.
 echo "🛡️ Deploying Layer-7 BitTorrent packet filters (Host & Forwarding)..."
-iptables -I FORWARD -p tcp -m string --string "BitTorrent" --algo bm -j DROP || true
-iptables -I FORWARD -p tcp -m string --string "BitTorrent protocol" --algo bm -j DROP || true
-iptables -I FORWARD -p udp -m string --string "BitTorrent" --algo bm -j DROP || true
-iptables -I FORWARD -p udp -m string --string "BitTorrent protocol" --algo bm -j DROP || true
-iptables -I OUTPUT -p tcp -m string --string "BitTorrent" --algo bm -j DROP || true
-iptables -I OUTPUT -p udp -m string --string "BitTorrent" --algo bm -j DROP || true
+for chain in OUTPUT FORWARD; do
+    for proto in tcp udp; do
+        for str in "BitTorrent" "BitTorrent protocol"; do
+            iptables -C "$chain" -p "$proto" -m string --string "$str" --algo bm -j DROP 2>/dev/null || \
+            iptables -I "$chain" -p "$proto" -m string --string "$str" --algo bm -j DROP || true
+        done
+    done
+done
 
 # Persist iptables rules across reboots
 if [ "$OS_ID" = "rocky" ] || [ "$OS_ID" = "almalinux" ] || [ "$OS_ID" = "rhel" ]; then
@@ -531,8 +543,11 @@ echo "  • Operating System:     $NAME ($VERSION_ID)"
 echo "  • 3X-UI Service:        $XUI_STATUS (bound strictly to 127.0.0.1:23600)"
 echo "  • Cloudflare WARP SOCKS:$WARP_CHECK"
 echo "  • Subscription Gateway: $ENHANCER_STATUS (isolated on 127.0.0.1)"
-echo "  • BitTorrent L7 Filter: active (Xray sniffer protocol drop + kernel host filter)"
-echo "  • ICMP Ping Blackhole:  active (silent mode)"
+if [ "$KEEP_ICMP" = true ]; then
+    echo "  • ICMP Posture:         active (Stack Mimicry mode, echo responses enabled)"
+else
+    echo "  • ICMP Posture:         active (Silent Blackhole mode, ping dropped)"
+fi
 echo "=========================================================="
 echo "🎉 Deployment successfully completed!"
 echo "   Next Steps:"

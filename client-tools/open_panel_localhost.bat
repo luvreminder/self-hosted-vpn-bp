@@ -10,13 +10,15 @@ set SSH_PORT=22
 set SSH_USER=root
 set SSH_KEY=%USERPROFILE%\.ssh\id_ed25519
 set PANEL_PORT=23600
+set SUB_PORT=2096
 set PANEL_PATH=web_secret_path
 
 echo ========================================================
 echo  Connecting to 3X-UI Panel via Encrypted SSH Tunnel
 echo ========================================================
-echo Target Server: %SERVER_IP%
-echo Local Port:    %PANEL_PORT%
+echo Target Server:    %SERVER_IP%
+echo Local Panel Port: %PANEL_PORT%
+echo Local Sub Port:   %SUB_PORT%
 echo.
 
 :: Check for SSH Key
@@ -31,7 +33,7 @@ if not exist "%SSH_KEY%" (
 echo Initializing secure SSH tunnel...
 start "" http://localhost:%PANEL_PORT%/%PANEL_PATH%/
 
-ssh %KEY_PARAM% -p %SSH_PORT% -N -L %PANEL_PORT%:127.0.0.1:%PANEL_PORT% %SSH_USER%@%SERVER_IP%
+ssh %KEY_PARAM% -p %SSH_PORT% -N -L %PANEL_PORT%:127.0.0.1:%PANEL_PORT% -L %SUB_PORT%:127.0.0.1:%SUB_PORT% %SSH_USER%@%SERVER_IP%
 
 echo.
 echo Tunnel closed.

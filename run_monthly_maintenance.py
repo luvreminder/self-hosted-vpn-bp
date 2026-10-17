@@ -25,25 +25,25 @@ import sqlite3
 import subprocess
 import secrets
 
-print("[+] === НАЧАЛО ЕЖЕМЕСЯЧНОГО ТЕХНИЧЕСКОГО ОБСЛУЖИВАНИЯ VPS ===")
+print("[+] === STARTING MONTHLY VPS MAINTENANCE & HARDENING ===")
 
 DB_PATH = "/etc/x-ui/x-ui.db"
 
 # -------------------------------------------------------------
-# ШАГ 1: Обновление GeoIP и GeoSite баз (RunetFreedom + Loyalsoldier)
+# STEP 1: Update GeoIP and GeoSite Databases (RunetFreedom + Loyalsoldier)
 # -------------------------------------------------------------
-print("\n[+] 1. Обновление антицензурных баз GeoIP и GeoSite...")
+print("\n[+] 1. Updating anti-censorship GeoIP and GeoSite databases...")
 try:
     res = subprocess.run(["/usr/bin/x-ui", "update-all-geofiles"], capture_output=True, text=True, timeout=120)
     print(res.stdout.strip())
-    print("[OK] Базы GeoIP и GeoSite успешно актуализированы.")
+    print("[OK] GeoIP and GeoSite databases successfully updated.")
 except Exception as e:
-    print(f"[!] Ошибка обновления гео-баз: {e}")
+    print(f"[!] Geo-database update warning: {e}")
 
 # -------------------------------------------------------------
-# ШАГ 2: Обслуживание Reality маскировок (SNI) и ротация Short IDs
+# STEP 2: Maintain Reality Camouflage (SNI) and Rotate Short IDs
 # -------------------------------------------------------------
-print("\n[+] 2. Обслуживание пула маскировки Reality (SNI) и криптографическая ротация Short IDs...")
+print("\n[+] 2. Maintaining Reality SNI camouflage pool and rotating Short IDs...")
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
 
@@ -59,8 +59,8 @@ if row:
     dest_target = reality.get("dest", "gateway.icloud.com:443").strip()
     dest_lower = dest_target.lower()
     
-    # КРИТИЧЕСКИ ВАЖНО: В Reality все serverNames обязаны строго совпадать с SAN сертификата dest!
-    # Нельзя смешивать несовместимые домены (Apple, Google, Microsoft) в одном инбаунде.
+    # CRITICAL: In Reality, all serverNames must strictly match the SAN certificate of dest!
+    # Do not mix incompatible domains (Apple, Google, Microsoft) in a single inbound.
     if "icloud" in dest_lower or "apple" in dest_lower:
         valid_snis = [
             "gateway.icloud.com",
@@ -97,7 +97,7 @@ if row:
             "c.s-microsoft.com": "Microsoft Static CDN 🛡️"
         }
     else:
-        # Для пользовательских доменов и Self-SNI (Steal Oneself) сохраняем текущие имена
+        # Preserve current names for custom domains and Self-SNI (Steal Oneself)
         current_names = reality.get("serverNames", [])
         dest_host = dest_target.split(":")[0]
         valid_snis = current_names if current_names else [dest_host]
@@ -105,14 +105,14 @@ if row:
 
     reality["serverNames"] = valid_snis
     
-    # Ротация Short IDs: удаляем скомпрометированные публичные ключи из шаблонов GitHub!
+    # Short ID rotation: purge known sample keys from public templates
     public_compromised_sids = {
         "859a72d4fa0c9a5e", "7b3c2e1f4a5d6089", "99aabbccddeeff00",
         "0123456789abcdef", "1234567890abcdef"
     }
     existing_sids = set(reality.get("shortIds", [])) - public_compromised_sids
     
-    # Генерируем свежие криптографически стойкие 8-байтные hex-токены
+    # Generate fresh cryptographically secure 8-byte hex tokens
     while len(existing_sids) < 4:
         existing_sids.add(secrets.token_hex(8))
     
@@ -121,16 +121,16 @@ if row:
     stream["realitySettings"] = reality
     
     cur.execute("UPDATE inbounds SET stream_settings=? WHERE id=1;", (json.dumps(stream),))
-    print(f"[OK] Reality Inbound #1 обновлен:")
+    print(f"[OK] Reality Inbound #1 updated:")
     print(f"     Dest: {dest_target}")
-    print(f"     Сертифицированные SAN SNI ({len(valid_snis)}): {', '.join(valid_snis)}")
-    print(f"     Криптографические Short IDs ({len(sorted_sids)}): {', '.join(sorted_sids)}")
+    print(f"     Validated SAN SNIs ({len(valid_snis)}): {', '.join(valid_snis)}")
+    print(f"     Cryptographic Short IDs ({len(sorted_sids)}): {', '.join(sorted_sids)}")
 
 # -------------------------------------------------------------
-# ШАГ 3: Актуализация описаний узлов в подписке (hosts table)
+# STEP 3: Synchronize Node Descriptions in Subscriptions (hosts table)
 # -------------------------------------------------------------
-print("\n[+] 3. Обновление каталога маскировок в подписках (Sub-Enhancer)...")
-# Определяем локацию сервера для корректного отображения страны в клиентах
+print("\n[+] 3. Updating subscription camouflage catalog (Sub-Enhancer)...")
+# Resolve server geo-location for accurate client display
 try:
     import urllib.request
     with urllib.request.urlopen("http://ip-api.com/json/?fields=country,countryCode", timeout=2.5) as r:
@@ -141,32 +141,48 @@ try:
 except Exception:
     geo_prefix = "🛡️ Stealth"
 
-# Синхронизируем таблицу hosts строго с валидным пулом SNI текущего инбаунда
+# Synchronize hosts table strictly with valid SNI pool of current inbound
+server_ip = os.environ.get("SERVER_IP", "").strip()
+if not server_ip:
+    try:
+        req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "curl/7.68.0"})
+        with urllib.request.urlopen(req, timeout=3.0) as r:
+            server_ip = r.read().decode("utf-8").strip()
+    except Exception:
+        server_ip = ""
+
 for order, sni in enumerate(valid_snis, start=1):
     base_label = sni_label_map.get(sni, f"CDN {sni}")
     remark = f"{geo_prefix} • {base_label}"
     sort_order = order * 10
-    cur.execute("SELECT id FROM hosts WHERE inbound_id=1 AND sni=?;", (sni,))
+    cur.execute("SELECT id, address, port FROM hosts WHERE inbound_id=1 AND sni=?;", (sni,))
     h_row = cur.fetchone()
     if h_row:
-        cur.execute("UPDATE hosts SET remark=?, sort_order=?, is_disabled=0 WHERE id=?;", (remark, sort_order, h_row[0]))
+        cur.execute(
+            "UPDATE hosts SET remark=?, server_description=?, sort_order=?, is_disabled=0, "
+            "address=COALESCE(NULLIF(address, ''), NULLIF(?, '')), "
+            "port=CASE WHEN port=0 THEN 443 ELSE port END, "
+            "fingerprint=COALESCE(NULLIF(fingerprint, ''), 'chrome') "
+            "WHERE id=?;",
+            (remark, remark, sort_order, server_ip, h_row[0])
+        )
     else:
         cur.execute(
-            "INSERT INTO hosts (inbound_id, sni, remark, sort_order, is_disabled, security, created_at, updated_at) "
-            "VALUES (1, ?, ?, ?, 0, 'same', strftime('%s', 'now') * 1000, strftime('%s', 'now') * 1000);",
-            (sni, remark, sort_order)
+            "INSERT INTO hosts (inbound_id, sni, remark, server_description, sort_order, is_disabled, security, address, port, fingerprint, created_at, updated_at) "
+            "VALUES (1, ?, ?, ?, ?, 0, 'same', NULLIF(?, ''), 443, 'chrome', strftime('%s', 'now') * 1000, strftime('%s', 'now') * 1000);",
+            (sni, remark, remark, sort_order, server_ip)
         )
 
-# Деактивируем несовместимые SNI от старых конфигураций
+# Deactivate incompatible SNIs from legacy configurations
 placeholders = ",".join("?" for _ in valid_snis)
 cur.execute(f"UPDATE hosts SET is_disabled=1 WHERE inbound_id=1 AND sni NOT IN ({placeholders});", tuple(valid_snis))
 conn.commit()
-print(f"[OK] {len(valid_snis)} узлов подписки успешно синхронизированы с SAN сертификата dest.")
+print(f"[OK] {len(valid_snis)} subscription nodes synchronized with dest SAN certificate.")
 
 # -------------------------------------------------------------
-# ШАГ 4: Обновление шаблона маршрутизации Xray (AI Smart Routing)
+# STEP 4: Update Xray Routing Template (AI Smart Routing & QUIC Hardening)
 # -------------------------------------------------------------
-print("\n[+] 4. Обновление правил умной маршрутизации нейросетей (AI Smart Routing)...")
+print("\n[+] 4. Updating AI smart routing rules and QUIC blocking...")
 cur.execute("SELECT value FROM settings WHERE key='xrayTemplateConfig';")
 t_row = cur.fetchone()
 config = json.loads(t_row[0]) if t_row else {}
@@ -242,9 +258,9 @@ config["outbounds"] = [
     }
 ]
 
-# Расширенный список ИИ сервисов
+# Extended list of AI services
 ai_domains = [
-    # Geosite группы
+    # Geosite groups
     "geosite:openai",
     "geosite:anthropic",
     "geosite:google-gemini",
@@ -284,7 +300,7 @@ ai_domains = [
     "domain:cursor.com",
     "domain:cursor-cdn.com",
     "domain:copilot.microsoft.com",
-    # Другие популярные ИИ-сервисы
+    # Additional AI Services
     "domain:perplexity.ai",
     "domain:midjourney.com",
     "domain:x.ai",
@@ -310,9 +326,14 @@ config["routing"] = {
         {
             "type": "field",
             "outboundTag": "blocked",
+            "ip": ["geoip:private"]
+        },
+        {
+            "type": "field",
+            "outboundTag": "blocked",
             "domain": ["geosite:category-ads-all"]
         },
-        # Блокировка QUIC (UDP 443) для ИИ предотвращает зависание приложений в WARP
+        # Block QUIC (UDP 443) for AI services to prevent stalled connections over WARP
         {
             "type": "field",
             "outboundTag": "blocked",
@@ -322,12 +343,14 @@ config["routing"] = {
                 "geosite:openai",
                 "geosite:anthropic",
                 "geosite:google-gemini",
+                "geosite:perplexity",
                 "domain:openai.com",
                 "domain:chatgpt.com",
                 "domain:anthropic.com",
                 "domain:claude.ai",
                 "domain:gemini.google.com",
-                "domain:aistudio.google.com"
+                "domain:aistudio.google.com",
+                "domain:perplexity.ai"
             ]
         },
         {
@@ -357,38 +380,37 @@ config["dns"] = {
 cur.execute("UPDATE settings SET value=? WHERE key='xrayTemplateConfig';", (json.dumps(config, indent=2),))
 conn.commit()
 conn.close()
-print(f"[OK] Шаблон Xray обновлен: {len(ai_domains)} ИИ-доменов перенаправляются через Cloudflare WARP.")
+print(f"[OK] Xray template updated: {len(ai_domains)} AI domains routed via Cloudflare WARP.")
 
 # -------------------------------------------------------------
-# ШАГ 5: Обслуживание и компактизация SQLite базы данных
+# STEP 5: SQLite Database Maintenance and Compaction
 # -------------------------------------------------------------
-print("\n[+] 5. Проверка целостности и сжатие базы данных SQLite...")
-# Приостанавливаем службу на 2 секунды для безопасного сброса WAL и дефрагментации
+print("\n[+] 5. Verifying integrity and vacuuming SQLite database...")
+# Briefly stop service to safely flush WAL and perform VACUUM
 subprocess.run(["systemctl", "stop", "x-ui"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 subprocess.run(["sqlite3", DB_PATH, "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 check_res = subprocess.run(["sqlite3", DB_PATH, "PRAGMA integrity_check;"], capture_output=True, text=True)
 print(f"[OK] SQLite Integrity Check: {check_res.stdout.strip()}")
 
-
 # -------------------------------------------------------------
-# ШАГ 6: Очистка логов и временных файлов
+# STEP 6: Clean Logs and Temporary Files
 # -------------------------------------------------------------
-print("\n[+] 6. Очистка системных журналов и временных файлов...")
+print("\n[+] 6. Cleaning system journals and temporary files...")
 subprocess.run(["journalctl", "--vacuum-time=14d", "--vacuum-size=100M"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 subprocess.run("rm -f /tmp/*.py /tmp/*.json /tmp/*.tmp 2>/dev/null || true", shell=True)
-print("[OK] Старые логи и временные файлы удалены.")
+print("[OK] Historical logs and temporary files cleaned.")
 
 # -------------------------------------------------------------
-# ШАГ 7: Перезапуск и проверка статуса служб
+# STEP 7: Restart and Verify Services
 # -------------------------------------------------------------
-print("\n[+] 7. Перезапуск 3X-UI и Sub-Enhancer...")
+print("\n[+] 7. Restarting 3X-UI and Sub-Enhancer...")
 subprocess.run(["systemctl", "restart", "x-ui"], check=True)
 subprocess.run(["systemctl", "restart", "sub-enhancer"], check=True)
 
 # -------------------------------------------------------------
-# ШАГ 8: Установка ежемесячного автоматического ТО (Systemd Timer)
+# STEP 8: Configure Automated Monthly Maintenance (Systemd Timer)
 # -------------------------------------------------------------
-print("\n[+] 8. Настройка автоматического ежемесячного обслуживания (Systemd Timer)...")
+print("\n[+] 8. Configuring automated monthly maintenance (Systemd Timer)...")
 
 maint_script_content = r'''#!/usr/bin/env bash
 # Monthly VPS Maintenance Script
@@ -450,7 +472,7 @@ Description=Timer for Automated Monthly VPS Maintenance
 Requires=vps-maintenance.service
 
 [Timer]
-# Запуск 1-го числа каждого месяца в 04:30 ночи
+# Run on the 1st of every month at 04:30 AM
 OnCalendar=*-*-01 04:30:00
 Persistent=true
 
@@ -463,9 +485,9 @@ with open("/etc/systemd/system/vps-maintenance.timer", "w") as f:
 
 subprocess.run(["systemctl", "daemon-reload"], check=True)
 subprocess.run(["systemctl", "enable", "--now", "vps-maintenance.timer"], check=True)
-print("[OK] Systemd Timer vps-maintenance.timer активирован (расписание: 1 число каждого месяца в 04:30).")
+print("[OK] Systemd Timer vps-maintenance.timer activated (schedule: 1st of every month at 04:30).")
 
-print("\n=== [✓] ЕЖЕМЕСЯЧНОЕ ТЕХНИЧЕСКОЕ ОБСЛУЖИВАНИЕ УСПЕШНО ЗАВЕРШЕНО ===")
+print("\n=== [✓] MONTHLY VPS MAINTENANCE COMPLETED SUCCESSFULLY ===")
 """
 
 def resolve_credentials(args):
@@ -496,21 +518,21 @@ def resolve_credentials(args):
                             k, v = line.split(delim, 1)
                             k = k.strip().upper()
                             v = v.strip().strip('"').strip("'")
-                            if not host and (k in ("IP", "HOST", "SERVER_IP", "SERVER") or "IP СЕРВЕРА" in k):
+                            if not host and (k in ("IP", "HOST", "SERVER_IP", "SERVER") or "IP" in k):
                                 if v and not v.startswith("YOUR_") and not v.startswith("<"):
                                     host = v
-                            if not port and (k in ("SSH_PORT", "PORT") or "ПОРТ" in k):
+                            if not port and (k in ("SSH_PORT", "PORT") or "PORT" in k):
                                 try:
                                     port = int(v)
                                 except ValueError:
                                     pass
-                            if not user and (k in ("SSH_USER", "USER", "USERNAME") or "ПОЛЬЗОВАТЕЛЬ" in k):
+                            if not user and (k in ("SSH_USER", "USER", "USERNAME") or "USER" in k):
                                 if v and not v.startswith("YOUR_"):
                                     user = v
-                            if not password and (k in ("PASSWORD", "SSH_PASSWORD", "ROOT_PASSWORD") or any(x in k for x in ["SSH ПАРОЛЬ", "ROOT ПАРОЛЬ", "ПАРОЛЬ ROOT", "ПАРОЛЬ"])):
+                            if not password and (k in ("PASSWORD", "SSH_PASSWORD", "ROOT_PASSWORD") or "PASS" in k):
                                 if v and not v.startswith("YOUR_") and not v.startswith("<"):
                                     password = v
-                            if not key_path and (k in ("SSH_KEY_PATH", "SSH_KEY", "KEY_PATH", "KEY") or "КЛЮЧ" in k):
+                            if not key_path and (k in ("SSH_KEY_PATH", "SSH_KEY", "KEY_PATH", "KEY") or "KEY" in k):
                                 if v and not v.startswith("<") and not v.startswith("YOUR_"):
                                     expanded = os.path.expandvars(os.path.expanduser(v))
                                     if os.path.exists(expanded):
@@ -541,12 +563,12 @@ def main():
     host, port, user, password, key_path = resolve_credentials(args)
 
     if not host:
-        print("[!] Ошибка: IP-адрес сервера не указан.")
-        print("    Укажите через аргумент: python run_monthly_maintenance.py --host <IP>")
-        print("    Или задайте переменную окружения: set VPS_HOST=<IP>")
+        print("[!] Error: VPS host IP address is required.")
+        print("    Specify via argument: python run_monthly_maintenance.py --host <IP>")
+        print("    Or set environment variable: VPS_HOST=<IP>")
         sys.exit(1)
 
-    print(f"[*] Подключение к серверу {host}:{port} (пользователь: {user})...")
+    print(f"[*] Connecting to server {host}:{port} as {user}...")
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -563,13 +585,13 @@ def main():
 
     ssh.connect(**connect_kwargs)
 
-    print("[*] Передача исполняемого сценария обслуживания...")
+    print("[*] Uploading maintenance script...")
     sftp = ssh.open_sftp()
     with sftp.file("/tmp/run_maintenance.py", "w") as f:
         f.write(REMOTE_SCRIPT)
     sftp.close()
 
-    print("[*] Выполнение технического обслуживания на сервере...")
+    print("[*] Executing remote maintenance...")
     stdin, stdout, stderr = ssh.exec_command("python3 /tmp/run_maintenance.py", get_pty=True)
 
     for line in stdout:
@@ -583,4 +605,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

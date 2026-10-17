@@ -23,6 +23,7 @@ DB_PATH = os.environ.get("XUI_DB_PATH", "/etc/x-ui/x-ui.db")
 SUB_LISTEN = os.environ.get("SUB_LISTEN", "127.0.0.1")
 SSL_CERT = os.environ.get("SUB_SSL_CERT", "/etc/x-ui/sub_cert.pem")
 SSL_KEY = os.environ.get("SUB_SSL_KEY", "/etc/x-ui/sub_key.pem")
+SUB_PUBLIC_IP = os.environ.get("SUB_PUBLIC_IP", "").strip()
 
 def get_sni_remarks():
     """Retrieve SNI to Remark mapping from 3X-UI SQLite database."""
@@ -113,6 +114,9 @@ class SubHandler(BaseHTTPRequestHandler):
                     for line in lines:
                         line = line.strip()
                         if line.startswith("vless://"):
+                            # Auto-heal missing host address from 3X-UI localhost fallback if SUB_PUBLIC_IP is configured
+                            if SUB_PUBLIC_IP:
+                                line = re.sub(r"@(localhost|127\.0\.0\.1):", f"@{SUB_PUBLIC_IP}:", line)
                             main_part, _, _ = line.partition("#")
                             parsed = urllib.parse.urlsplit(main_part)
                             query = urllib.parse.parse_qs(parsed.query)

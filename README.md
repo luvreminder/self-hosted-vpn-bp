@@ -728,16 +728,15 @@ To restore a snapshot, copy the backup file back to `/etc/x-ui/x-ui.db` and exec
 
 System operators can verify their server's stealth posture and confirm resistance to scanners using standard diagnostic utilities executed from an external workstation:
 
-#### 1. Verify Management Interface Isolation
-Execute a port scan targeting the administrative port and standard panel ports from an external workstation:
+#### 1. Verify Management & Subscription Interface Isolation
+Execute a port scan targeting the administrative port and subscription ports from an external workstation:
 ```bash
-nmap -Pn -p 22,443,2096,2053,23600 <YOUR_VPS_IP>
+nmap -Pn -p 22,443,2095,2096,28443,2053,23600 <YOUR_VPS_IP>
 ```
-* **Expected Result:**
+* **Expected Result (Single-Port Surface):**
   * Port `22` (SSH): `open`
   * Port `443` (VLESS Reality): `open`
-  * Port `2096` (Subscription Gateway): `open`
-  * Ports `2053` and `23600` (Panel): `closed` or `filtered` (Zero external exposure)
+  * Ports `2053`, `23600` (Panel) and `2095`, `2096`, `28443` (Subscription Gateways): `closed` or `filtered` (Zero external exposure; accessible exclusively via the encrypted SSH tunnel).
 
 #### 2. Verify VLESS Reality Active Probing Fallback
 Simulate an unauthenticated probe on port 443 using `openssl`:
@@ -748,19 +747,21 @@ openssl s_client -connect <YOUR_VPS_IP>:443 -servername gateway.icloud.com -show
   * The handshake succeeds, displaying the authentic DigiCert SSL certificate issued to `*.icloud.com` / `gateway.icloud.com`.
   * No proxy signatures, self-signed certificates, or Xray identifiers are leaked.
 
-#### 3. Verify ICMP Ping Blackhole Mode
+#### 3. Verify ICMP Posture
 Send ICMP echo requests to the server IP:
 ```bash
 ping -c 4 <YOUR_VPS_IP>
 ```
-* **Expected Result:** `100% packet loss` (The server ignores ping probes entirely).
+* **Expected Result:**
+  * Default mode: `100% packet loss` (Host ignores opportunistic ping sweeps).
+  * Stack Mimicry mode (`--keep-icmp`): Normal ICMP Echo Replies matching standard web/CDN server behavior.
 
-#### 4. Verify Subscription Gateway Sanitization
-Test an unauthenticated HTTP request against the public subscription port:
+#### 4. Verify Subscription Gateway Sanitization (via SSH Tunnel)
+With the SSH tunnel active (`client-tools/open_panel_localhost.sh` or `.bat`), test an unauthenticated root request against the local forwarded subscription port:
 ```bash
-curl -I http://<YOUR_VPS_IP>:2096/
+curl -I http://127.0.0.1:2096/
 ```
-* **Expected Result:** `HTTP/1.0 404 Not Found` (or empty response) with zero disclosure of internal subscription endpoints or 3X-UI headers.
+* **Expected Result:** `HTTP/1.0 404 Not Found` (or empty response) with `Cache-Control: no-store` and `X-Content-Type-Options: nosniff` headers, and zero disclosure of internal 3X-UI fingerprints.
 
 ---
 
