@@ -43,65 +43,109 @@ except Exception as e:
 # -------------------------------------------------------------
 # ШАГ 2: Обслуживание Reality маскировок (SNI) и ротация Short IDs
 # -------------------------------------------------------------
-print("\n[+] 2. Обслуживание пула маскировки Reality (SNI) и добавление новых Short IDs...")
+print("\n[+] 2. Обслуживание пула маскировки Reality (SNI) и криптографическая ротация Short IDs...")
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
 
 cur.execute("SELECT id, stream_settings FROM inbounds WHERE id=1;")
 row = cur.fetchone()
+dest_target = "gateway.icloud.com:443"
+valid_snis = ["gateway.icloud.com"]
+sni_label_map = {}
+
 if row:
     stream = json.loads(row[1])
     reality = stream.get("realitySettings", {})
+    dest_target = reality.get("dest", "gateway.icloud.com:443").strip()
+    dest_lower = dest_target.lower()
     
-    # Расширенный пул проверенных TLS 1.3 CDN эндпоинтов для маскировки трафика
-    expanded_snis = [
-        "gateway.icloud.com",
-        "dl.google.com",
-        "swdist.apple.com",
-        "updates.cdn-apple.com",
-        "configuration.apple.com",
-        "www.microsoft.com",
-        "www.samsung.com",
-        "fota-cloud-dn.ospserver.net",
-        "www.speedtest.net"
-    ]
-    reality["serverNames"] = expanded_snis
+    # КРИТИЧЕСКИ ВАЖНО: В Reality все serverNames обязаны строго совпадать с SAN сертификата dest!
+    # Нельзя смешивать несовместимые домены (Apple, Google, Microsoft) в одном инбаунде.
+    if "icloud" in dest_lower or "apple" in dest_lower:
+        valid_snis = [
+            "gateway.icloud.com",
+            "configuration.apple.com",
+            "swdist.apple.com",
+            "updates.cdn-apple.com",
+            "appleid.apple.com"
+        ]
+        sni_label_map = {
+            "gateway.icloud.com": "Apple iCloud Mobile Stealth 📱",
+            "configuration.apple.com": "Apple Device Provisioning 🛡️",
+            "swdist.apple.com": "Apple Software CDN ⚡",
+            "updates.cdn-apple.com": "Apple System CDN 🍏",
+            "appleid.apple.com": "Apple Auth Gateway 🔒"
+        }
+    elif "google" in dest_lower:
+        valid_snis = [
+            "dl.google.com",
+            "www.google.com",
+            "fonts.googleapis.com"
+        ]
+        sni_label_map = {
+            "dl.google.com": "Google CDN Fast ⚡",
+            "www.google.com": "Google Search CDN 🌐",
+            "fonts.googleapis.com": "Google Fonts CDN 🔤"
+        }
+    elif "microsoft" in dest_lower:
+        valid_snis = [
+            "www.microsoft.com",
+            "c.s-microsoft.com"
+        ]
+        sni_label_map = {
+            "www.microsoft.com": "Microsoft Web CDN 💻",
+            "c.s-microsoft.com": "Microsoft Static CDN 🛡️"
+        }
+    else:
+        # Для пользовательских доменов и Self-SNI (Steal Oneself) сохраняем текущие имена
+        current_names = reality.get("serverNames", [])
+        dest_host = dest_target.split(":")[0]
+        valid_snis = current_names if current_names else [dest_host]
+        sni_label_map = {s: f"Custom Stealth ({s}) 🔒" for s in valid_snis}
+
+    reality["serverNames"] = valid_snis
     
-    # Ротация Short IDs: сохраняем старые + добавляем 2 свежих криптографических 8-байтных ключа
-    current_sids = set(reality.get("shortIds", []))
-    # Гарантируем наличие базовых
-    base_sids = ["859a72d4fa0c9a5e", "7b3c2e1f4a5d6089", "99aabbccddeeff00"]
-    for sid in base_sids:
-        current_sids.add(sid)
+    # Ротация Short IDs: удаляем скомпрометированные публичные ключи из шаблонов GitHub!
+    public_compromised_sids = {
+        "859a72d4fa0c9a5e", "7b3c2e1f4a5d6089", "99aabbccddeeff00",
+        "0123456789abcdef", "1234567890abcdef"
+    }
+    existing_sids = set(reality.get("shortIds", [])) - public_compromised_sids
     
-    while len(current_sids) < 5:
-        current_sids.add(secrets.token_hex(8))
+    # Генерируем свежие криптографически стойкие 8-байтные hex-токены
+    while len(existing_sids) < 4:
+        existing_sids.add(secrets.token_hex(8))
     
-    sorted_sids = sorted(list(current_sids))
+    sorted_sids = sorted(list(existing_sids))
     reality["shortIds"] = sorted_sids
     stream["realitySettings"] = reality
     
     cur.execute("UPDATE inbounds SET stream_settings=? WHERE id=1;", (json.dumps(stream),))
     print(f"[OK] Reality Inbound #1 обновлен:")
-    print(f"     SNI эндпоинты ({len(expanded_snis)}): {', '.join(expanded_snis[:4])} ...")
-    print(f"     Short IDs ({len(sorted_sids)}): {', '.join(sorted_sids)}")
+    print(f"     Dest: {dest_target}")
+    print(f"     Сертифицированные SAN SNI ({len(valid_snis)}): {', '.join(valid_snis)}")
+    print(f"     Криптографические Short IDs ({len(sorted_sids)}): {', '.join(sorted_sids)}")
 
 # -------------------------------------------------------------
 # ШАГ 3: Актуализация описаний узлов в подписке (hosts table)
 # -------------------------------------------------------------
 print("\n[+] 3. Обновление каталога маскировок в подписках (Sub-Enhancer)...")
-sni_descriptions = [
-    ("gateway.icloud.com", "🇦🇶 Antarctica • Mobile Stealth (Apple iCloud) 📱", 10),
-    ("dl.google.com", "🇦🇶 Antarctica • Fast Wi-Fi (Google CDN) ⚡", 20),
-    ("swdist.apple.com", "🇦🇶 Antarctica • Apple Services CDN 🛡️", 30),
-    ("updates.cdn-apple.com", "🇦🇶 Antarctica • Apple System CDN 🍏", 40),
-    ("www.microsoft.com", "🇦🇶 Antarctica • Windows / Microsoft CDN 💻", 50),
-    ("www.samsung.com", "🇦🇶 Antarctica • Samsung Ecosystem 📡", 60),
-    ("fota-cloud-dn.ospserver.net", "🇦🇶 Antarctica • Samsung FOTA CDN 📲", 70),
-    ("www.speedtest.net", "🇦🇶 Antarctica • Ookla Ultra CDN 🚀", 80),
-]
+# Определяем локацию сервера для корректного отображения страны в клиентах
+try:
+    import urllib.request
+    with urllib.request.urlopen("http://ip-api.com/json/?fields=country,countryCode", timeout=2.5) as r:
+        geo_info = json.loads(r.read().decode())
+        c_code = geo_info.get("countryCode", "")
+        flag = "".join(chr(127397 + ord(c)) for c in c_code.upper()) if len(c_code) == 2 else "🌐"
+        geo_prefix = f"{flag} {geo_info.get('country', 'VPS')}"
+except Exception:
+    geo_prefix = "🛡️ Stealth"
 
-for sni, remark, sort_order in sni_descriptions:
+# Синхронизируем таблицу hosts строго с валидным пулом SNI текущего инбаунда
+for order, sni in enumerate(valid_snis, start=1):
+    base_label = sni_label_map.get(sni, f"CDN {sni}")
+    remark = f"{geo_prefix} • {base_label}"
+    sort_order = order * 10
     cur.execute("SELECT id FROM hosts WHERE inbound_id=1 AND sni=?;", (sni,))
     h_row = cur.fetchone()
     if h_row:
@@ -113,7 +157,11 @@ for sni, remark, sort_order in sni_descriptions:
             (sni, remark, sort_order)
         )
 
-print(f"[OK] {len(sni_descriptions)} узлов подписки с богатыми описаниями синхронизированы.")
+# Деактивируем несовместимые SNI от старых конфигураций
+placeholders = ",".join("?" for _ in valid_snis)
+cur.execute(f"UPDATE hosts SET is_disabled=1 WHERE inbound_id=1 AND sni NOT IN ({placeholders});", tuple(valid_snis))
+conn.commit()
+print(f"[OK] {len(valid_snis)} узлов подписки успешно синхронизированы с SAN сертификата dest.")
 
 # -------------------------------------------------------------
 # ШАГ 4: Обновление шаблона маршрутизации Xray (AI Smart Routing)
@@ -351,9 +399,13 @@ echo "=== [$(date)] Starting Scheduled Monthly Maintenance ==="
 echo "[*] Updating GeoIP & GeoSite databases..."
 /usr/bin/x-ui update-all-geofiles || true
 
-# 2. SQLite maintenance
+# 2. SQLite maintenance (Safely stop x-ui before VACUUM to prevent locking/corruption)
+echo "[*] Safely stopping 3X-UI for SQLite maintenance..."
+systemctl stop x-ui || true
 echo "[*] SQLite VACUUM and WAL Checkpoint..."
 sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;" || true
+echo "[*] Starting 3X-UI service..."
+systemctl start x-ui || true
 
 # 3. Clean system journals
 echo "[*] Cleaning logs..."
@@ -368,9 +420,9 @@ if ! curl -s -x socks5h://127.0.0.1:40000 --max-time 5 https://www.cloudflare.co
 fi
 
 # 5. Restart services
-echo "[*] Restarting services..."
-systemctl restart x-ui || true
+echo "[*] Verifying services..."
 systemctl restart sub-enhancer || true
+systemctl is-active --quiet x-ui || systemctl restart x-ui || true
 
 echo "=== [$(date)] Monthly Maintenance Completed Successfully ==="
 '''
@@ -423,27 +475,57 @@ def resolve_credentials(args):
     password = args.password or os.environ.get("VPS_PASSWORD")
     key_path = args.key or os.environ.get("VPS_SSH_KEY")
 
-    # Look for local credentials.txt if not explicitly passed
-    for p in ["credentials.txt", "../credentials.txt", os.path.join(os.path.dirname(__file__), "..", "credentials.txt")]:
+    # Look for local credentials.txt across probable workspace paths
+    cred_paths = [
+        "credentials.txt",
+        "../credentials.txt",
+        os.path.join(os.path.dirname(__file__), "..", "credentials.txt"),
+        os.path.join(os.path.dirname(__file__), "credentials.txt")
+    ]
+    for p in cred_paths:
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
-                        if not host and "IP сервера:" in line:
-                            parts = line.split(":", 1)
-                            if len(parts) > 1:
-                                host = parts[1].strip()
-                        if not password and any(k in line for k in ["SSH Пароль:", "Root Пароль:", "Пароль root:"]):
-                            parts = line.split(":", 1)
-                            if len(parts) > 1:
-                                password = parts[1].strip()
+                        line = line.strip()
+                        if not line or line.startswith("#") or line.startswith("["):
+                            continue
+                        # Delimiter detection: '=' or ':'
+                        delim = "=" if "=" in line else (":" if ":" in line else None)
+                        if delim:
+                            k, v = line.split(delim, 1)
+                            k = k.strip().upper()
+                            v = v.strip().strip('"').strip("'")
+                            if not host and (k in ("IP", "HOST", "SERVER_IP", "SERVER") or "IP СЕРВЕРА" in k):
+                                if v and not v.startswith("YOUR_") and not v.startswith("<"):
+                                    host = v
+                            if not port and (k in ("SSH_PORT", "PORT") or "ПОРТ" in k):
+                                try:
+                                    port = int(v)
+                                except ValueError:
+                                    pass
+                            if not user and (k in ("SSH_USER", "USER", "USERNAME") or "ПОЛЬЗОВАТЕЛЬ" in k):
+                                if v and not v.startswith("YOUR_"):
+                                    user = v
+                            if not password and (k in ("PASSWORD", "SSH_PASSWORD", "ROOT_PASSWORD") or any(x in k for x in ["SSH ПАРОЛЬ", "ROOT ПАРОЛЬ", "ПАРОЛЬ ROOT", "ПАРОЛЬ"])):
+                                if v and not v.startswith("YOUR_") and not v.startswith("<"):
+                                    password = v
+                            if not key_path and (k in ("SSH_KEY_PATH", "SSH_KEY", "KEY_PATH", "KEY") or "КЛЮЧ" in k):
+                                if v and not v.startswith("<") and not v.startswith("YOUR_"):
+                                    expanded = os.path.expandvars(os.path.expanduser(v))
+                                    if os.path.exists(expanded):
+                                        key_path = expanded
             except Exception:
                 pass
+            if host and (password or key_path):
+                break
 
     if not key_path:
-        default_key = os.path.expanduser("~/.ssh/vps_ed25519")
-        if os.path.exists(default_key):
-            key_path = default_key
+        for default_key in ["~/.ssh/id_ed25519", "~/.ssh/vps_ed25519", "~/.ssh/id_rsa"]:
+            expanded = os.path.expanduser(default_key)
+            if os.path.exists(expanded):
+                key_path = expanded
+                break
 
     return host, port, user, password, key_path
 

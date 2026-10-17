@@ -29,9 +29,9 @@ This specification represents a complete, hardened **Golden Standard reference a
 
 * **Production-Grade Isolation:** The 3X-UI panel is bound strictly to `localhost` and accessible only through an encrypted SSH tunnel. The server operates in an ICMP blackhole mode (ignoring ping probes).
 * **Intelligent Outbound Split-Routing:** High-performance direct egress for streaming, gaming, and general web browsing, combined with transparent, selective routing through a local Cloudflare WARP SOCKS5 proxy (`127.0.0.1:40000`) exclusively for AI platforms.
-* **Multi-SNI Disguise Profiles:** Independent server masquerades tailored for cellular networks (`gateway.icloud.com`) and broadband Wi-Fi (`dl.google.com`).
-* **Automated Subscription Gateway (`sub-enhancer`):** An autonomous background daemon that resolves dynamic node labels from SQLite, normalizes URL input errors, and serves encrypted subscriptions (`happ://crypt5/...`) with automatic 12-hour background refresh headers.
-* **Kernel-Level Abuse Protection:** Layer-7 packet filtering drops BitTorrent handshake strings before packets leave the server.
+* **Multi-SNI Disguise Profiles:** Independent server masquerades tailored for cellular networks and broadband Wi-Fi, strictly validated against the target server's SAN certificate.
+* **Automated Subscription Gateway (`sub-enhancer`):** An autonomous background daemon that resolves dynamic node labels from SQLite, normalizes URL input errors, enforces localhost / TLS isolation, and injects automatic 12-hour background refresh headers.
+* **Host & Protocol Abuse Protection:** Dual-tier anti-BitTorrent protection combining Xray Core deep protocol sniffing (`protocol: ["bittorrent"] -> blackhole`) with kernel-level packet filters.
 * **Universal Compatibility:** Fully tested across modern enterprise Linux (Rocky Linux 9, AlmaLinux 9) and Debian-family releases (Ubuntu 22.04/24.04, Debian 12).
 * **Active Probing Defense & Comprehensive Stealth:** Full ICMP blackhole mode (ignoring ping sweeps) coupled with VLESS Reality cryptographic fallback to genuine Apple and Google TLS 1.3 endpoints. Unauthenticated probes receive authentic third-party SSL certificates, while uTLS and XTLS-Vision neutralize heuristic DPI fingerprinting.
 
@@ -195,16 +195,19 @@ Active probing is a technique where network inspection middleboxes intercept sus
 * **Traffic Fingerprinting Resistance (uTLS & XTLS-Vision):**
   * **uTLS Emulation:** Client software emulates the exact TLS ClientHello byte signatures of standard consumer web browsers (`Chrome`, `Safari`), defeating JA3 and JA4 signature-based heuristic classifiers.
   * **XTLS-Vision Direct Splice:** Eliminates the classic "TLS-in-TLS" double-encryption artifact and applies dynamic packet padding, preventing flow-length analysis from identifying encrypted proxy streams.
-* **Multi-SNI Selection Rationale:**
-  * `gateway.icloud.com` (Apple Private Relay): Highly effective across mobile cellular networks. Because Apple routes Private Relay traffic across diverse third-party partner autonomous systems (Fastly, Akamai, Cloudflare), DPI systems cannot reliably classify an IP-SNI ASN mismatch as proxy activity without causing catastrophic false positives for iOS device traffic.
-  * `dl.google.com` (Google CDN): Optimized for high-throughput broadband fiber connections, leveraging widespread Google global caching infrastructure.
+* **Multi-SNI Selection Rationale & Foreign SNI Nuances:**
+  * `gateway.icloud.com` (Apple Private Relay): Highly resilient on mobile cellular networks because Apple distributes egress across partner CDNs (Fastly, Akamai, Cloudflare), reducing simple ASN mismatch triggers.
+  * `dl.google.com` (Google CDN): High-throughput broadband caching endpoints.
+  * **Critical Foreign SNI Vulnerability (Active Probe Latency & ASN Mismatch):**  
+    When a commercial VPS (e.g. Hetzner, OVH, Aeza) presents an SNI belonging to Google or Apple, DPI probes can measure the round-trip latency difference (RTT) between the VPS's TCP `SYN-ACK` (<10ms) and the TLS `ServerHello` forwarded from `dest` (+30–80ms). Furthermore, all `serverNames` in a single Reality inbound **must strictly belong to the SAN of the certificate served by `dest`**; mismatched SNIs cause immediate probe TLS errors.
+  * **Self-SNI / Steal Oneself:** The ultimate countermeasure to Foreign SNI active probing is hosting a lightweight local web service (via Nginx or Caddy with a real Let's Encrypt certificate) on `127.0.0.1:8443` and pointing Reality `dest` to it. This produces 0 ms forwarding latency and 100% ASN parity.
 
 #### 3. Protection Against Copyright Trolls & Automated Abuse Scanners
 * **DMCA Crawler Threat Model:** Automated copyright enforcement crawlers monitor public BitTorrent swarms, logging swarm IP addresses and dispatching automated DMCA infringement notices directly to upstream hosting providers.
-* **Dual-Layer Kernel & Core Blackholing:**
-  * *Kernel Layer:* Linux `iptables` Boyer-Moore string matching drops TCP/UDP packets containing `BitTorrent` protocol signatures at the network layer before processing.
-  * *Application Layer:* Xray-core internal routing drops `protocol: ["bittorrent"]` and private subnet traffic into a blackhole outbound (`"protocol": "blackhole"`).
-  * This dual-layer enforcement ensures peer-to-peer handshakes are dropped instantly before leaving the server interface, preventing hosting account suspensions.
+* **Dual-Layer Core & Kernel Enforcement:**
+  * *Application Layer (Xray Core):* Because Xray is a userspace proxy, proxy client traffic terminates at `INPUT` and originates new connections at `OUTPUT`, completely bypassing `iptables FORWARD`. Deep protocol sniffing inside Xray Core (`protocol: ["bittorrent"] -> blackhole`) is the primary engine that inspects packet structures and drops BitTorrent handshakes (including encrypted MSE/PE flows).
+  * *Kernel Layer (`iptables OUTPUT`):* Linux `iptables` Boyer-Moore string matching drops any accidental P2P packets generated directly by host-level processes.
+  * This dual-layer architecture prevents BitTorrent traffic from ever leaving the server interface, eliminating hosting account suspensions.
 
 ---
 
@@ -270,14 +273,21 @@ fi
 ---
 
 ### Step 2: Layer-7 BitTorrent Filtering (Anti-DMCA)
-Install kernel string-matching rules to immediately drop P2P traffic:
+
+> [!IMPORTANT]
+> **Userspace Proxy vs Kernel Packet Filtering:**  
+> Xray Core operates as a userspace application. Inbound proxy traffic connects to the server's TCP socket (`INPUT` chain), where Xray decrypts the stream and initiates independent outbound TCP/UDP sessions (`OUTPUT` chain). Client proxy traffic **never traverses the kernel `FORWARD` chain**!  
+> Furthermore, modern BitTorrent clients employ Message Stream Encryption (MSE/PE) and uTP/DHT, which renders simple string matching inside packets ineffective against modern P2P traffic.  
+> **True Layer-7 Protection:** Real anti-torrent protection is enforced directly within the Xray Core routing engine via deep protocol sniffing (`"protocol": ["bittorrent"] -> "blocked"`).  
+> The kernel `iptables` rules below provide complementary defense-in-depth on the `OUTPUT` and `FORWARD` chains to prevent rogue host processes or forwarding daemons from participating in torrent swarms:
+
 ```bash
+iptables -I OUTPUT -p tcp -m string --string "BitTorrent" --algo bm -j DROP
+iptables -I OUTPUT -p udp -m string --string "BitTorrent" --algo bm -j DROP
 iptables -I FORWARD -p tcp -m string --string "BitTorrent" --algo bm -j DROP
-iptables -I FORWARD -p tcp -m string --string "BitTorrent protocol" --algo bm -j DROP
 iptables -I FORWARD -p udp -m string --string "BitTorrent" --algo bm -j DROP
-iptables -I FORWARD -p udp -m string --string "BitTorrent protocol" --algo bm -j DROP
 ```
-*Persist rules across reboots: On RHEL/Rocky Linux, install `iptables-services` and run `service iptables save`. On Ubuntu/Debian, install `iptables-persistent`.*
+*Persist rules across reboots: On RHEL/Rocky Linux, run `service iptables save`. On Ubuntu/Debian, install `iptables-persistent` and run `netfilter-persistent save`.*
 
 ---
 
@@ -310,94 +320,273 @@ warp-cli --accept-tos connect
 ---
 
 ### Step 4: Install 3X-UI & Isolate Panel Access
-Deploy the 3X-UI management panel:
+Deploy the 3X-UI management panel and programmatically isolate it strictly to `127.0.0.1` in the database to prevent exposure to public internet scanners:
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+
+# Stop x-ui to safely update database settings and prevent race conditions
+systemctl stop x-ui
+
+# Strictly bind panel and subscription service to localhost (IPv4 127.0.0.1)
+sqlite3 /etc/x-ui/x-ui.db << 'EOF'
+INSERT INTO settings (key, value) VALUES ('webListen', '127.0.0.1') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+INSERT INTO settings (key, value) VALUES ('webPort', '23600') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+INSERT INTO settings (key, value) VALUES ('webBasePath', '/web_secret_path/') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+INSERT INTO settings (key, value) VALUES ('subListen', '127.0.0.1') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+INSERT INTO settings (key, value) VALUES ('subPort', '2095') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+INSERT INTO settings (key, value) VALUES ('subEnable', 'true') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+INSERT INTO settings (key, value) VALUES ('subPath', '/sub/') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+EOF
+
+# Enforce default-deny firewall (only SSH and port 443 open to the public)
+# For Ubuntu / Debian:
+ufw default deny incoming && ufw default allow outgoing
+ufw allow 22/tcp comment 'SSH'
+ufw allow 443/tcp comment 'VLESS-REALITY'
+ufw --force enable
+
+# For Rocky / AlmaLinux:
+# systemctl enable --now firewalld && firewall-cmd --permanent --add-service=ssh && firewall-cmd --permanent --add-port=443/tcp && firewall-cmd --reload
+
+systemctl start x-ui
 ```
-Ensure the panel web port (e.g. `23600`) is accessible strictly via `localhost` and not exposed to the public network interface.
 
 ---
 
 ### Step 5: Configure Xray Core Routing (`xrayTemplateConfig`)
-Apply the hardened Xray configuration template directing selected AI platforms to the `warp-socks` outbound:
+Apply the hardened Xray configuration template directing selected AI platforms to the `warp-socks` outbound.
+
+> [!CAUTION]
+> **API and Stats Sections Required:**  
+> The `api`, `stats`, `policy`, and `dokodemo-door` sections must be present in `xrayTemplateConfig`. Omitting them breaks 3X-UI user traffic statistics, bandwidth accounting, and client expiration tracking!
 
 ```json
 {
+  "api": {
+    "tag": "api",
+    "services": [
+      "HandlerService",
+      "LoggerService",
+      "StatsService",
+      "RoutingService"
+    ]
+  },
+  "stats": {},
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true,
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    }
+  },
+  "inbounds": [
+    {
+      "tag": "api",
+      "listen": "127.0.0.1",
+      "port": 62789,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      }
+    }
+  ],
   "outbounds": [
-    { "tag": "direct", "protocol": "freedom", "settings": {} },
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
+    },
     {
       "tag": "warp-socks",
       "protocol": "socks",
       "settings": {
-        "servers": [{ "address": "127.0.0.1", "port": 40000 }]
+        "servers": [
+          {
+            "address": "127.0.0.1",
+            "port": 40000
+          }
+        ]
       }
     },
-    { "tag": "blocked", "protocol": "blackhole", "settings": {} }
+    {
+      "tag": "blocked",
+      "protocol": "blackhole",
+      "settings": {
+        "response": {
+          "type": "http"
+        }
+      }
+    }
   ],
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "type": "field",
-        "outboundTag": "blocked",
-        "protocol": ["bittorrent"]
+        "inboundTag": [
+          "api"
+        ],
+        "outboundTag": "api"
       },
       {
         "type": "field",
         "outboundTag": "blocked",
-        "ip": ["geoip:private"]
+        "protocol": [
+          "bittorrent"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "blocked",
+        "ip": [
+          "geoip:private"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "blocked",
+        "domain": [
+          "geosite:category-ads-all"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "blocked",
+        "port": "443",
+        "network": "udp",
+        "domain": [
+          "geosite:openai",
+          "geosite:anthropic",
+          "geosite:google-gemini",
+          "geosite:perplexity",
+          "domain:openai.com",
+          "domain:chatgpt.com",
+          "domain:anthropic.com",
+          "domain:claude.ai",
+          "domain:gemini.google.com",
+          "domain:aistudio.google.com",
+          "domain:perplexity.ai"
+        ]
       },
       {
         "type": "field",
         "outboundTag": "warp-socks",
         "domain": [
+          "geosite:openai",
+          "geosite:anthropic",
+          "geosite:google-gemini",
+          "geosite:perplexity",
           "domain:openai.com",
           "domain:chatgpt.com",
           "domain:oaistatic.com",
           "domain:oaiusercontent.com",
-          "domain:ai.com",
           "domain:sora.com",
+          "domain:ai.com",
+          "domain:chat.openai.com",
+          "domain:auth0.openai.com",
+          "domain:client-api.arkoselabs.com",
+          "domain:featuregates.org",
+          "domain:statsig.com",
+          "domain:statsigapi.net",
           "domain:anthropic.com",
           "domain:claude.ai",
           "domain:claude.com",
-          "domain:perplexity.ai"
+          "domain:gemini.google.com",
+          "domain:aistudio.google.com",
+          "domain:generativelanguage.googleapis.com",
+          "domain:alkalimakersuite-pa.googleapis.com",
+          "domain:proactivebackend-pa.googleapis.com",
+          "domain:deepmind.google",
+          "domain:notebooklm.google",
+          "domain:notebooklm.google.com",
+          "domain:ai.google.dev",
+          "domain:generativeai.google",
+          "domain:vertexai.googleapis.com",
+          "domain:aiplatform.googleapis.com",
+          "domain:cursor.sh",
+          "domain:cursor.com",
+          "domain:cursor-cdn.com",
+          "domain:copilot.microsoft.com",
+          "domain:perplexity.ai",
+          "domain:midjourney.com",
+          "domain:x.ai",
+          "domain:grok.com",
+          "domain:deepseek.com",
+          "domain:mistral.ai",
+          "domain:cohere.com"
         ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "network": "tcp,udp"
       }
     ]
+  },
+  "dns": {
+    "servers": [
+      "https://1.1.1.1/dns-query",
+      "https://8.8.8.8/dns-query",
+      "1.1.1.1",
+      "8.8.8.8",
+      "localhost"
+    ],
+    "queryStrategy": "UseIPv4"
   }
 }
 ```
 
 > [!NOTE]
-> **Rationale for Selective Multi-Egress Routing:**  
-> Modern online services and AI APIs enforce divergent, often opposing IP reputation and fraud detection models:
-> * **Datacenter ASN Classification:** Platforms targeting automated scrapers (e.g. OpenAI, Anthropic, Perplexity) frequently challenge or outright block commercial cloud hosting Autonomous System Numbers (ASNs). Routing their domains through an edge-peered proxy such as Cloudflare WARP masks the datacenter origin and satisfies anti-bot Turnstile checks.
-> * **Shared Egress Noise & Session Affinity:** In contrast, large-scale consumer ecosystems and identity providers maintain high-volume threat intelligence that heavily rate-limits well-known shared proxy ranges due to widespread abuse. Furthermore, enterprise platforms enforce strict Single Sign-On (SSO) session IP consistency, treating discrepancies between login authentication endpoints and application APIs as security anomalies.
-> * **Architectural Balance:** A selective multi-egress policy directs ASN-restricted platforms through the auxiliary edge proxy, while allowing session-sensitive, high-trust services to egress directly via the host's clean dedicated IP. This eliminates CAPTCHAs, maximizes transfer speeds, and guarantees session stability.
+> **Why Block QUIC (UDP 443) for AI Domains?**  
+> Cloudflare WARP in SOCKS5 proxy mode (`127.0.0.1:40000`) only proxies TCP connections. When mobile apps (such as the ChatGPT and Claude apps) attempt HTTP/3 (QUIC over UDP:443), packets are dropped or hang indefinitely, resulting in eternal loading spinners. Blocking UDP:443 for AI domains forces client web browsers and mobile apps to immediately fallback to stable, high-speed TCP/TLS.
 
 ---
 
 ### Step 6: Configure VLESS Reality & Multi-SNI Endpoints
+
 1. **Primary Inbound:**
    * **Protocol:** `VLESS`
    * **Port:** `443` (TCP)
    * **Security:** `REALITY`
    * **Flow:** `xtls-rprx-vision`
    * **Sniffing:** Enabled for `http`, `tls`, `quic`.
-   * **ShortIds Pool:** Specify multiple 8-byte hexadecimal keys in `shortIds` (e.g. `["859a72d4fa0c9a5e", "7b3c2e1f4a5d6089", "99aabbccddeeff00"]`) to enable seamless client key rotation without service disruption.
-2. **Masquerade Endpoints (Hosts Tab in 3X-UI):**
-   * **Host 1 (Cellular):** SNI: `gateway.icloud.com`, Remark: `Mobile Stealth (Apple iCloud) 📱`.
-   * **Host 2 (Broadband Wi-Fi):** SNI: `dl.google.com`, Remark: `Fast Wi-Fi (Google CDN) ⚡`.
-   * **Host 3 (CDN Backup):** SNI: `swdist.apple.com`, Remark: `Backup Stealth (Apple CDN) 🛡️`.
+   * **ShortIds Pool:** Generate random 8-byte hexadecimal tokens (e.g. `python3 -c "import secrets; print(secrets.token_hex(8))"`). **Never reuse public sample shortIds from GitHub!**
+
+2. **Crucial Rule for Reality Multi-SNI (SAN Certificate Matching):**
+   > [!WARNING]
+   > In VLESS Reality, all domains specified in `serverNames` **MUST belong to the Subject Alternative Names (SAN) of the certificate returned by the `dest` server!**  
+   > **Do NOT mix Apple, Google, Microsoft, and Samsung domains into a single inbound!**  
+   > If your `dest` is `gateway.icloud.com:443`, an active censorship probe connecting with `SNI = www.microsoft.com` will receive Apple's certificate (`*.icloud.com`) from your server. The scanner detects the certificate mismatch and immediately flags and blocks your IP.
+
+   * **Apple Inbound (`dest = gateway.icloud.com:443`):**
+     * SNI Pool: `gateway.icloud.com`, `configuration.apple.com`, `swdist.apple.com`, `updates.cdn-apple.com`, `appleid.apple.com`.
+   * **Google Inbound (`dest = dl.google.com:443`):**
+     * SNI Pool: `dl.google.com`, `www.google.com`, `fonts.googleapis.com`.
+   * **Self-SNI / Steal Oneself (Ultimate Stealth Tier):**
+     * For zero latency probe RTT and 100% ASN matching, host a real static website on the VPS using Nginx or Caddy on `127.0.0.1:8443` with a genuine Let's Encrypt TLS certificate for your own domain. Point Reality `dest` to `127.0.0.1:8443`. Active probes will see 0 ms internal RTT and matching ASN, making detection mathematically indistinguishable from a legitimate web server.
 
 ---
 
 ### Step 7: Deploy Subscription Gateway (`sub-enhancer`)
-The subscription enhancer dynamically transforms subscription URLs, assigns explicit remark titles to endpoints, and supports dual-port listening:
 
-* **Executable:** `/usr/local/bin/sub-enhancer.py` (simultaneously listens on standard port `2096` and hardened custom port `28443`, forwarding to 3X-UI internal subscription port `2095`).
+> [!CAUTION]
+> **Subscription Security & Threat Model:**  
+> Serving subscription URLs over plain HTTP (`http://`) on public ports (`2096`, `28443`) transmits your VLESS credentials, UUIDs, Reality public keys (`pbk`), and Short IDs in unencrypted base64 across the internet. Censorship DPI and ISPs sniffing these ports can immediately extract and block your proxy credentials!  
+> **Hardened Practice:**  
+> 1. By default, `sub-enhancer.py` binds strictly to `127.0.0.1` and is accessed securely through the encrypted SSH tunnel (`http://localhost:23600/...` or `localhost:2096`).  
+> 2. If remote subscription distribution without SSH is required, `sub-enhancer.py` must use TLS/HTTPS encryption with SSL certificates (`/etc/x-ui/sub_cert.pem`).
+
+* **Executable:** `/usr/local/bin/sub-enhancer.py` (normalizes URL typos, injects `hosts` table labels, and adds `Profile-Update-Interval: 12` headers).
 * **Systemd Unit:** `/etc/systemd/system/sub-enhancer.service`.
-* **Automatic Healing:** Automatically rewrites client URL typos and injects `Profile-Update-Interval: 12` headers.
 
 Enable and start the service:
 ```bash
@@ -409,19 +598,21 @@ systemctl enable --now sub-enhancer
 
 ## 📱 5. Client Application Setup & Multi-SNI Profiles
 
-### 5.1. Importing the Encrypted Subscription (Happ / Shadowrocket / v2rayN)
+### 5.1. Importing the Subscription (Happ / Shadowrocket / v2rayN / v2rayNG)
 1. Launch the 3X-UI management console via the SSH tunnel tool (`open_panel_localhost.bat` on Windows or `open_panel_localhost.sh` on macOS/Linux).
-2. Click the **QR Code** icon next to your client record in the inbound list, and copy the encrypted happ://crypt5/... URL (or direct HTTP subscription URL).
-3. Open **Happ** (or Shadowrocket / v2rayN) on your mobile device or computer and add the subscription.
-4. **Autonomous Synchronizations:** The subscription header enforces automatic synchronization every 12 hours (Profile-Update-Interval: 12). To manually pull newly added nodes at any time, tap the 🔄 icon inside Happ.
+2. Click the **QR Code** icon next to your client record in the inbound list, and copy the subscription URL (e.g. via local tunnel `http://127.0.0.1:23600/...` or secure `https://` endpoint).
+3. Open **Happ** (or Shadowrocket / v2rayN / v2rayNG) on your device and import the subscription.
+4. **Autonomous Synchronizations:** The subscription header enforces automatic synchronization every 12 hours (`Profile-Update-Interval: 12`). To manually pull newly updated nodes or shortIds at any time, tap the 🔄 refresh icon inside your client.
 
 ### 5.2. Client-Side Split Tunneling & Routing Policies
 To maximize throughput and avoid latency on regional banking, government, and media services:
 1. In Happ, set the Rule Order to: **Block → Direct → Proxy**.
-2. **Behavior:**
-   * Ad trackers and malicious telemetry match **Block** and are discarded immediately.
-   * Domestic websites, local banking apps, and low-latency domestic services match **Direct** and bypass the VPN completely, connecting at maximum physical ISP line speeds.
-   * International services, AI platforms, streaming networks, and blocked endpoints match **Proxy** and route securely through the hardened remote VPS.
+2. **Behavior & Operational Nuances:**
+   * **Block:** Ad trackers, telemetry, and malicious domains (`geosite:category-ads-all`) are discarded immediately.
+   * **Direct:** Domestic websites, local banking apps, and low-latency domestic services (`geosite:ru`, `geoip:ru`) bypass the VPN completely, connecting at maximum physical ISP line speeds.
+     * *Nuance Note:* Some international blocked resources may use domestic CDN nodes, while certain regional services may utilize foreign cloud IPs. Keep your client's GeoSite and GeoIP routing databases updated.
+   * **Proxy:** International services, AI platforms, streaming networks, and blocked endpoints match **Proxy** and route securely through the hardened remote VPS.
+   * **IPv6 Leak Protection:** If your local ISP provides IPv6, ensure your client is set to prefer IPv4 (`UseIPv4` / `IPv4 Preferred`) or disable IPv6 tunneling if the VPS egress uses dedicated IPv4. This eliminates silent DPI leaks and connection resets over unmonitored IPv6 routes.
 
 ### 5.3. Essential Client DNS & Anti-Loop Configuration
 To ensure maximum responsiveness for AI platforms and prevent management lockouts:

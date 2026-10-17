@@ -103,10 +103,15 @@
         "domain": [
           "geosite:openai",
           "geosite:anthropic",
+          "geosite:google-gemini",
+          "geosite:perplexity",
           "domain:openai.com",
           "domain:chatgpt.com",
           "domain:anthropic.com",
-          "domain:claude.ai"
+          "domain:claude.ai",
+          "domain:gemini.google.com",
+          "domain:aistudio.google.com",
+          "domain:perplexity.ai"
         ]
       },
       {
@@ -115,6 +120,7 @@
         "domain": [
           "geosite:openai",
           "geosite:anthropic",
+          "geosite:google-gemini",
           "geosite:perplexity",
           "domain:openai.com",
           "domain:chatgpt.com",
@@ -131,7 +137,29 @@
           "domain:anthropic.com",
           "domain:claude.ai",
           "domain:claude.com",
-          "domain:perplexity.ai"
+          "domain:gemini.google.com",
+          "domain:aistudio.google.com",
+          "domain:generativelanguage.googleapis.com",
+          "domain:alkalimakersuite-pa.googleapis.com",
+          "domain:proactivebackend-pa.googleapis.com",
+          "domain:deepmind.google",
+          "domain:notebooklm.google",
+          "domain:notebooklm.google.com",
+          "domain:ai.google.dev",
+          "domain:generativeai.google",
+          "domain:vertexai.googleapis.com",
+          "domain:aiplatform.googleapis.com",
+          "domain:cursor.sh",
+          "domain:cursor.com",
+          "domain:cursor-cdn.com",
+          "domain:copilot.microsoft.com",
+          "domain:perplexity.ai",
+          "domain:midjourney.com",
+          "domain:x.ai",
+          "domain:grok.com",
+          "domain:deepseek.com",
+          "domain:mistral.ai",
+          "domain:cohere.com"
         ]
       },
       {
@@ -140,5 +168,15 @@
         "network": "tcp,udp"
       }
     ]
+  },
+  "dns": {
+    "servers": [
+      "https://1.1.1.1/dns-query",
+      "https://8.8.8.8/dns-query",
+      "1.1.1.1",
+      "8.8.8.8",
+      "localhost"
+    ],
+    "queryStrategy": "UseIPv4"
   }
 }

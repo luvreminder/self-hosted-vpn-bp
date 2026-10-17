@@ -182,7 +182,9 @@ echo "net.ipv4.icmp_echo_ignore_all=1" >> /etc/sysctl.conf
 sysctl -p
 
 # 8. Host protection against BitTorrent (Layer-7 Anti-DMCA)
-echo "🛡️ Deploying Layer-7 BitTorrent packet filters..."
+# Note: Xray proxy traffic is filtered inside Xray Core via "protocol": ["bittorrent"] -> blackhole.
+# The following iptables rules provide kernel defense-in-depth for host processes.
+echo "🛡️ Deploying Layer-7 BitTorrent packet filters (Host & Forwarding)..."
 iptables -I FORWARD -p tcp -m string --string "BitTorrent" --algo bm -j DROP || true
 iptables -I FORWARD -p tcp -m string --string "BitTorrent protocol" --algo bm -j DROP || true
 iptables -I FORWARD -p udp -m string --string "BitTorrent" --algo bm -j DROP || true
@@ -197,24 +199,28 @@ elif [ "$OS_ID" = "ubuntu" ] || [ "$OS_ID" = "debian" ]; then
     netfilter-persistent save || true
 fi
 
-# 9. Firewall rules configuration (firewalld / ufw)
-echo "🔒 Configuring firewall: Opening required proxy & subscription ports..."
-if systemctl is-active --quiet firewalld; then
-    firewall-cmd --permanent --add-service=ssh || true
-    firewall-cmd --permanent --add-port=443/tcp || true
-    for p in $(echo "$SUB_PORTS" | tr ',' ' '); do
-        firewall-cmd --permanent --add-port="${p}/tcp" || true
-    done
-    firewall-cmd --reload || true
-    echo "✅ Firewalld rules configured."
-elif command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
-    ufw allow 22/tcp || true
-    ufw allow 443/tcp || true
-    for p in $(echo "$SUB_PORTS" | tr ',' ' '); do
-        ufw allow "${p}/tcp" || true
-    done
-    echo "✅ UFW rules configured."
-fi
+# 9. Firewall rules configuration (firewalld / ufw) - Strict Default Deny
+echo "🔒 Configuring firewall: Enforcing default-deny with SSH (22/tcp) & VLESS Reality (443/tcp)..."
+case "$OS_ID" in
+    ubuntu|debian)
+        ufw default deny incoming || true
+        ufw default allow outgoing || true
+        ufw allow 22/tcp comment 'SSH' || true
+        ufw allow 443/tcp comment 'VLESS-REALITY' || true
+        # 3X-UI Web (23600) and Sub (2095) remain closed to public internet
+        ufw --force enable || true
+        echo "✅ UFW configured and activated."
+        ;;
+    rocky|almalinux|rhel|centos)
+        systemctl enable --now firewalld || true
+        firewall-cmd --permanent --remove-service=cockpit 2>/dev/null || true
+        firewall-cmd --permanent --add-service=ssh || true
+        firewall-cmd --permanent --add-port=443/tcp || true
+        # 3X-UI Web (23600) and Sub (2095) remain closed to public internet
+        firewall-cmd --reload || true
+        echo "✅ Firewalld configured and activated."
+        ;;
+esac
 
 # 10. Deploy Cloudflare WARP SOCKS5 client (Port 40000)
 if [ "$SKIP_WARP" = false ]; then
@@ -261,17 +267,45 @@ if [ ! -d "/usr/local/x-ui" ]; then
     bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
 fi
 
-# 12. Apply hardened Xray routing template to 3X-UI SQLite database
+# 12. Enforce strict localhost isolation & apply hardened Xray routing template
 DB_PATH="/etc/x-ui/x-ui.db"
 TEMPLATE_FILE="$SCRIPT_DIR/xray_template_config.json"
 
+# Stop x-ui to safely update database settings and prevent race conditions
+systemctl stop x-ui || true
+
 if [ -f "$DB_PATH" ]; then
+    echo "🔒 Hardening 3X-UI panel: Binding strictly to 127.0.0.1:23600 (accessible only via SSH tunnel)..."
+    sqlite3 "$DB_PATH" << SQL_EOF
+INSERT INTO settings (key, value) VALUES ('webListen', '127.0.0.1')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+INSERT INTO settings (key, value) VALUES ('webPort', '23600')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+INSERT INTO settings (key, value) VALUES ('webBasePath', '/web_secret_path/')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+INSERT INTO settings (key, value) VALUES ('subListen', '127.0.0.1')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+INSERT INTO settings (key, value) VALUES ('subPort', '2095')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+INSERT INTO settings (key, value) VALUES ('subEnable', 'true')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+INSERT INTO settings (key, value) VALUES ('subPath', '/sub/')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+SQL_EOF
+    echo "✅ 3X-UI panel and subscription server bound strictly to localhost."
+
     echo "⚙️ Configuring hardened Xray Core split-routing in 3X-UI database..."
     if [ -f "$TEMPLATE_FILE" ]; then
         ROUTING_JSON=$(cat "$TEMPLATE_FILE")
     else
-        # Embedded fallback routing template
-        ROUTING_JSON='{"outbounds":[{"tag":"direct","protocol":"freedom","settings":{}},{"tag":"warp-socks","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":40000}]}},{"tag":"blocked","protocol":"blackhole","settings":{}}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","outboundTag":"blocked","protocol":["bittorrent"]},{"type":"field","outboundTag":"blocked","ip":["geoip:private"]},{"type":"field","outboundTag":"warp-socks","domain":["domain:openai.com","domain:chatgpt.com","domain:oaistatic.com","domain:oaiusercontent.com","domain:ai.com","domain:sora.com","domain:anthropic.com","domain:claude.ai","domain:claude.com","domain:perplexity.ai"]}]}}'
+        # Embedded fallback routing template (Full with api, stats, dokodemo-door, bittorrent, and AI QUIC block)
+        ROUTING_JSON='{"api":{"tag":"api","services":["HandlerService","LoggerService","StatsService","RoutingService"]},"stats":{},"policy":{"levels":{"0":{"statsUserUplink":true,"statsUserDownlink":true}},"system":{"statsInboundUplink":true,"statsInboundDownlink":true,"statsOutboundUplink":true,"statsOutboundDownlink":true}},"inbounds":[{"tag":"api","listen":"127.0.0.1","port":62789,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1"}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIPv4"}},{"tag":"warp-socks","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":40000}]}},{"tag":"blocked","protocol":"blackhole","settings":{"response":{"type":"http"}}}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","inboundTag":["api"],"outboundTag":"api"},{"type":"field","outboundTag":"blocked","protocol":["bittorrent"]},{"type":"field","outboundTag":"blocked","ip":["geoip:private"]},{"type":"field","outboundTag":"blocked","domain":["geosite:category-ads-all"]},{"type":"field","outboundTag":"blocked","port":"443","network":"udp","domain":["geosite:openai","geosite:anthropic","geosite:google-gemini","geosite:perplexity","domain:openai.com","domain:chatgpt.com","domain:anthropic.com","domain:claude.ai","domain:gemini.google.com","domain:aistudio.google.com","domain:perplexity.ai"]},{"type":"field","outboundTag":"warp-socks","domain":["geosite:openai","geosite:anthropic","geosite:google-gemini","geosite:perplexity","domain:openai.com","domain:chatgpt.com","domain:oaistatic.com","domain:oaiusercontent.com","domain:sora.com","domain:ai.com","domain:chat.openai.com","domain:auth0.openai.com","domain:client-api.arkoselabs.com","domain:featuregates.org","domain:statsig.com","domain:statsigapi.net","domain:anthropic.com","domain:claude.ai","domain:claude.com","domain:gemini.google.com","domain:aistudio.google.com","domain:generativelanguage.googleapis.com","domain:alkalimakersuite-pa.googleapis.com","domain:proactivebackend-pa.googleapis.com","domain:deepmind.google","domain:notebooklm.google","domain:notebooklm.google.com","domain:ai.google.dev","domain:generativeai.google","domain:vertexai.googleapis.com","domain:aiplatform.googleapis.com","domain:cursor.sh","domain:cursor.com","domain:cursor-cdn.com","domain:copilot.microsoft.com","domain:perplexity.ai","domain:midjourney.com","domain:x.ai","domain:grok.com","domain:deepseek.com","domain:mistral.ai","domain:cohere.com"]},{"type":"field","outboundTag":"direct","network":"tcp,udp"}]},"dns":{"servers":["https://1.1.1.1/dns-query","https://8.8.8.8/dns-query","1.1.1.1","8.8.8.8","localhost"],"queryStrategy":"UseIPv4"}}'
     fi
 
     # Update or insert xrayTemplateConfig in SQLite settings table
@@ -280,35 +314,58 @@ INSERT INTO settings (key, value) VALUES ('xrayTemplateConfig', '$ROUTING_JSON')
 ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 SQL_EOF
 
-    # Restart x-ui to load the updated routing template
-    systemctl restart x-ui || true
+    # Start x-ui to load the updated isolated settings and routing template
+    systemctl start x-ui || true
     echo "✅ Hardened Xray routing applied and x-ui service restarted."
 fi
 
 # 13. Deploy Sub-Enhancer background daemon
-echo "🛠️ Deploying Sub-Enhancer subscription gateway (ports: $SUB_PORTS)..."
+echo "🛠️ Deploying Sub-Enhancer subscription gateway..."
 TARGET_ENHANCER="/usr/local/bin/sub-enhancer.py"
+
+# Generate local self-signed TLS cert for subscription encryption if not present
+if [ ! -f "/etc/x-ui/sub_cert.pem" ]; then
+    mkdir -p /etc/x-ui
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout /etc/x-ui/sub_key.pem -out /etc/x-ui/sub_cert.pem -days 3650 -subj "/CN=SecureSub" 2>/dev/null || true
+    chmod 600 /etc/x-ui/sub_key.pem 2>/dev/null || true
+fi
 
 if [ -f "$SCRIPT_DIR/sub-enhancer.py" ]; then
     cp "$SCRIPT_DIR/sub-enhancer.py" "$TARGET_ENHANCER"
 else
     cat << 'EOF' > "$TARGET_ENHANCER"
 #!/usr/bin/env python3
-import sys, os, sqlite3, base64, urllib.request, urllib.parse
+import sys, os, re, ssl, sqlite3, base64, urllib.request, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-UPSTREAM = "http://127.0.0.1:2095"
-DB_PATH = "/etc/x-ui/x-ui.db"
+UPSTREAM = os.environ.get("SUB_UPSTREAM", "http://127.0.0.1:2095")
+DB_PATH = os.environ.get("XUI_DB_PATH", "/etc/x-ui/x-ui.db")
+SUB_LISTEN = os.environ.get("SUB_LISTEN", "127.0.0.1")
+SSL_CERT = os.environ.get("SUB_SSL_CERT", "/etc/x-ui/sub_cert.pem")
+SSL_KEY = os.environ.get("SUB_SSL_KEY", "/etc/x-ui/sub_key.pem")
 
 def get_sni_remarks():
+    if not os.path.exists(DB_PATH):
+        return {}
     try:
         conn = sqlite3.connect(DB_PATH, timeout=2.0)
         cur = conn.cursor()
-        rows = cur.execute("SELECT sni, remark FROM hosts WHERE is_disabled=0 AND remark IS NOT NULL AND remark != ''").fetchall()
+        rows = cur.execute(
+            "SELECT sni, remark FROM hosts WHERE is_disabled=0 AND remark IS NOT NULL AND remark != ''"
+        ).fetchall()
         conn.close()
-        return {sni: remark for sni, remark in rows if sni}
+        return {sni.strip(): remark.strip() for sni, remark in rows if sni and sni.strip()}
     except Exception:
         return {}
+
+def normalize_request_path(raw_path):
+    parsed = urllib.parse.urlsplit(raw_path)
+    clean_path = re.sub(r"/+", "/", parsed.path).strip()
+    if not clean_path.startswith("/"):
+        clean_path = "/" + clean_path
+    if parsed.query:
+        return f"{clean_path}?{parsed.query}"
+    return clean_path
 
 class SubHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -321,12 +378,17 @@ class SubHandler(BaseHTTPRequestHandler):
         self.proxy_request("HEAD")
 
     def proxy_request(self, method):
-        upstream_url = UPSTREAM + self.path
-        req_headers = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length")}
+        normalized_path = normalize_request_path(self.path)
+        upstream_url = UPSTREAM + normalized_path
+
+        req_headers = {
+            k: v for k, v in self.headers.items()
+            if k.lower() not in ("host", "content-length", "connection")
+        }
         req = urllib.request.Request(upstream_url, headers=req_headers, method=method)
 
         try:
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
+            with urllib.request.urlopen(req, timeout=8.0) as resp:
                 status = resp.status
                 headers = dict(resp.headers)
                 body = resp.read() if method == "GET" else b""
@@ -344,7 +406,7 @@ class SubHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self.send_response(502)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
-            msg = f"Bad Gateway: {e}".encode()
+            msg = f"Bad Gateway: {e}".encode("utf-8")
             self.send_header("Content-Length", str(len(msg)))
             self.end_headers()
             if method == "GET":
@@ -353,20 +415,28 @@ class SubHandler(BaseHTTPRequestHandler):
 
         if status == 200 and method == "GET" and body:
             try:
-                decoded = base64.b64decode(body).decode("utf-8", errors="ignore")
+                padded_body = body.strip()
+                padding_needed = (-len(padded_body)) % 4
+                if padding_needed:
+                    padded_body += b"=" * padding_needed
+
+                decoded = base64.b64decode(padded_body).decode("utf-8", errors="ignore")
                 if "vless://" in decoded:
                     sni_map = get_sni_remarks()
                     lines = decoded.strip().splitlines()
                     new_lines = []
                     for line in lines:
+                        line = line.strip()
                         if line.startswith("vless://"):
                             main_part, _, _ = line.partition("#")
-                            parsed = urllib.parse.urlparse(main_part)
+                            parsed = urllib.parse.urlsplit(main_part)
                             query = urllib.parse.parse_qs(parsed.query)
-                            sni = query.get("sni", [""])[0]
-                            title = sni_map.get(sni, "Proxy Node")
+                            sni = query.get("sni", [""])[0].strip()
+                            title = sni_map.get(sni)
+                            if not title:
+                                title = f"Node ({sni})" if sni else "Golden Standard Proxy"
                             new_lines.append(f"{main_part}#{urllib.parse.quote(title)}")
-                        else:
+                        elif line:
                             new_lines.append(line)
                     body = base64.b64encode("\n".join(new_lines).encode("utf-8"))
             except Exception:
@@ -377,22 +447,36 @@ class SubHandler(BaseHTTPRequestHandler):
             if k.lower() not in ("content-length", "transfer-encoding", "connection", "profile-update-interval"):
                 self.send_header(k, v)
         self.send_header("Profile-Update-Interval", "12")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, private")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if method == "GET" and body:
             self.wfile.write(body)
 
-def start_server(port):
-    server = ThreadingHTTPServer(("0.0.0.0", port), SubHandler)
+def start_server(listen_ip, port, ssl_ctx=None):
+    server = ThreadingHTTPServer((listen_ip, port), SubHandler)
+    if ssl_ctx:
+        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
     server.serve_forever()
 
 if __name__ == "__main__":
     import threading
-    ports = [int(p.strip()) for p in os.environ.get("SUB_PORTS", "2096,28443").split(",") if p.strip()]
+    ssl_context = None
+    if os.path.exists(SSL_CERT) and os.path.exists(SSL_KEY):
+        try:
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.load_cert_chain(certfile=SSL_CERT, keyfile=SSL_KEY)
+            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        except Exception:
+            ssl_context = None
+
+    raw_ports = os.environ.get("SUB_PORTS", "2096,28443").split(",")
+    ports = [int(p.strip()) for p in raw_ports if p.strip()]
     for p in ports[:-1]:
-        t = threading.Thread(target=start_server, args=(p,), daemon=True)
+        t = threading.Thread(target=start_server, args=(SUB_LISTEN, p, ssl_context), daemon=True)
         t.start()
-    start_server(ports[-1])
+    start_server(SUB_LISTEN, ports[-1], ssl_context)
 EOF
 fi
 chmod +x "$TARGET_ENHANCER"
@@ -406,6 +490,7 @@ After=network.target x-ui.service
 Type=simple
 User=root
 Environment="SUB_PORTS=$SUB_PORTS"
+Environment="SUB_LISTEN=127.0.0.1"
 ExecStart=/usr/bin/python3 $TARGET_ENHANCER
 Restart=always
 RestartSec=3s
@@ -443,15 +528,15 @@ fi
 
 echo "  • Virtualization:       $VIRT_TYPE"
 echo "  • Operating System:     $NAME ($VERSION_ID)"
-echo "  • 3X-UI Service:        $XUI_STATUS"
+echo "  • 3X-UI Service:        $XUI_STATUS (bound strictly to 127.0.0.1:23600)"
 echo "  • Cloudflare WARP SOCKS:$WARP_CHECK"
-echo "  • Subscription Gateway: $ENHANCER_STATUS"
-echo "  • BitTorrent L7 Filter: active (dropped at kernel layer)"
+echo "  • Subscription Gateway: $ENHANCER_STATUS (isolated on 127.0.0.1)"
+echo "  • BitTorrent L7 Filter: active (Xray sniffer protocol drop + kernel host filter)"
 echo "  • ICMP Ping Blackhole:  active (silent mode)"
 echo "=========================================================="
 echo "🎉 Deployment successfully completed!"
 echo "   Next Steps:"
-echo "   1. Connect to panel via SSH tunnel: open_panel_localhost.bat / .sh"
-echo "   2. Configure VLESS Reality inbound on port 443 with multi-SNI hosts."
-echo "   3. Import encrypted subscription URL into your Happ client."
+echo "   1. Connect to panel via SSH tunnel: client-tools/open_panel_localhost.bat / .sh"
+echo "   2. Configure VLESS Reality inbound on port 443 with SNIs matching your dest certificate."
+echo "   3. Fetch subscription securely over SSH tunnel (http://127.0.0.1:23600/ or :2096/)."
 echo "=========================================================="
