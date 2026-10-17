@@ -1,9 +1,46 @@
 {
+  "api": {
+    "tag": "api",
+    "services": [
+      "HandlerService",
+      "LoggerService",
+      "StatsService",
+      "RoutingService"
+    ]
+  },
+  "stats": {},
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true
+      }
+    },
+    "system": {
+      "statsInboundUplink": true,
+      "statsInboundDownlink": true,
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    }
+  },
+  "inbounds": [
+    {
+      "tag": "api",
+      "listen": "127.0.0.1",
+      "port": 62789,
+      "protocol": "dokodemo-door",
+      "settings": {
+        "address": "127.0.0.1"
+      }
+    }
+  ],
   "outbounds": [
     {
       "tag": "direct",
       "protocol": "freedom",
-      "settings": {}
+      "settings": {
+        "domainStrategy": "UseIPv4"
+      }
     },
     {
       "tag": "warp-socks",
@@ -20,12 +57,23 @@
     {
       "tag": "blocked",
       "protocol": "blackhole",
-      "settings": {}
+      "settings": {
+        "response": {
+          "type": "http"
+        }
+      }
     }
   ],
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "api"
+        ],
+        "outboundTag": "api"
+      },
       {
         "type": "field",
         "outboundTag": "blocked",
@@ -42,19 +90,54 @@
       },
       {
         "type": "field",
+        "outboundTag": "blocked",
+        "domain": [
+          "geosite:category-ads-all"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "blocked",
+        "port": "443",
+        "network": "udp",
+        "domain": [
+          "geosite:openai",
+          "geosite:anthropic",
+          "domain:openai.com",
+          "domain:chatgpt.com",
+          "domain:anthropic.com",
+          "domain:claude.ai"
+        ]
+      },
+      {
+        "type": "field",
         "outboundTag": "warp-socks",
         "domain": [
+          "geosite:openai",
+          "geosite:anthropic",
+          "geosite:perplexity",
           "domain:openai.com",
           "domain:chatgpt.com",
           "domain:oaistatic.com",
           "domain:oaiusercontent.com",
-          "domain:ai.com",
           "domain:sora.com",
+          "domain:ai.com",
+          "domain:chat.openai.com",
+          "domain:auth0.openai.com",
+          "domain:client-api.arkoselabs.com",
+          "domain:featuregates.org",
+          "domain:statsig.com",
+          "domain:statsigapi.net",
           "domain:anthropic.com",
           "domain:claude.ai",
           "domain:claude.com",
           "domain:perplexity.ai"
         ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "network": "tcp,udp"
       }
     ]
   }

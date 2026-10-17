@@ -81,6 +81,7 @@ This repository distribution bundle includes:
   * [6.4. Database Backup Strategy](#64-database-backup-strategy)
   * [6.5. Troubleshooting Runbook](#65-troubleshooting-runbook)
   * [6.6. Verification of Server Stealth & Scanner Invisibility](#66-verification-of-server-stealth--scanner-invisibility-audit-runbook)
+* [🔄 7. Routine & Monthly VPS Maintenance Runbook](#-7-routine--monthly-vps-maintenance-runbook)
 * [📄 License](#-license)
 * [⚠️ Educational Disclaimer & Operational Liability Notice](#️-educational-disclaimer--operational-liability-notice)
 
@@ -569,6 +570,76 @@ Test an unauthenticated HTTP request against the public subscription port:
 curl -I http://<YOUR_VPS_IP>:2096/
 ```
 * **Expected Result:** `HTTP/1.0 404 Not Found` (or empty response) with zero disclosure of internal subscription endpoints or 3X-UI headers.
+
+---
+
+## 🔄 7. Routine & Monthly VPS Maintenance Runbook
+
+> **💡 The Censorship Resistance Lifecycle Principle:**  
+> A proxy server degrades over time not from software faults, but from shifts in the external network environment: DPI middleboxes update SNI heuristics, AI platforms introduce new auth endpoints, and OS packages accrue security CVEs. Regular monthly maintenance guarantees 100% service uptime and perpetual immunity to censorship blocking.
+
+### 🤖 7.1. Automated Zero-Touch Systemd Timer
+A recurring systemd maintenance timer is configured to run automatically:
+* **Maintenance Executable:** `/usr/local/bin/vps-monthly-maintenance.sh`
+* **Systemd Timer:** `vps-maintenance.timer` (scheduled for the **1st of every month at 04:30 AM**).
+* **Automated Actions:**
+  1. Fetches freshest anti-censorship routing databases (`x-ui update-all-geofiles`).
+  2. Flushes SQLite write-ahead log and defragments the database (`PRAGMA wal_checkpoint(TRUNCATE); VACUUM;`).
+  3. Vacuums systemd journal logs older than 14 days or exceeding 100MB.
+  4. Verifies Cloudflare WARP health and re-registers the daemon if dropped.
+  5. Gracefully restarts `x-ui` and `sub-enhancer` to apply updated geo-rules.
+
+```bash
+# Check scheduled timer status
+systemctl list-timers | grep vps-maintenance
+
+# Review latest maintenance execution logs
+journalctl -u vps-maintenance.service -n 30 --no-pager
+```
+
+---
+
+### 📋 7.2. Step-by-Step Manual Maintenance Checklist
+For on-demand audits or manual refreshes:
+
+1. **OS Security Packages:**
+   ```bash
+   dnf upgrade -y --security  # On Enterprise Linux (Rocky / AlmaLinux)
+   # apt update && apt upgrade -y  # On Ubuntu / Debian
+   ```
+2. **Sync Anti-Censorship Geo-Databases:**
+   ```bash
+   x-ui update-all-geofiles
+   ```
+3. **Rotate Reality Short IDs:**
+   Generate a new 8-byte hex key (`openssl rand -hex 8`) and append it to the `shortIds` array under Inbound #1 in 3X-UI without deleting existing keys.
+4. **Optimize SQLite Database:**
+   ```bash
+   systemctl stop x-ui
+   sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA integrity_check;"
+   systemctl start x-ui
+   ```
+5. **Verify Cloudflare WARP Egress:**
+   ```bash
+   curl -s -x socks5h://127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|loc="
+   ```
+6. **Prune Stale Logs:**
+   ```bash
+   journalctl --vacuum-time=14d --vacuum-size=100M
+   ```
+7. **Audit Fail2ban Jail:**
+   ```bash
+   fail2ban-client status sshd
+   ```
+
+---
+
+### ⚡ 7.3. One-Click Remote Maintenance Script
+Operators on Windows, macOS, or Linux workstations can trigger the entire maintenance cycle in a single command using [run_monthly_maintenance.py](run_monthly_maintenance.py):
+
+```bash
+python community-edition/run_monthly_maintenance.py
+```
 
 ---
 
