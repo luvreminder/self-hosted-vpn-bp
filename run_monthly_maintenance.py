@@ -258,12 +258,11 @@ config["outbounds"] = [
     }
 ]
 
-# Extended list of AI services
+# Extended list of AI services routed via Cloudflare WARP (excluding Google Gemini which uses clean direct German IP)
 ai_domains = [
     # Geosite groups
     "geosite:openai",
     "geosite:anthropic",
-    "geosite:google-gemini",
     "geosite:perplexity",
     # OpenAI, ChatGPT, Sora
     "domain:openai.com",
@@ -282,19 +281,6 @@ ai_domains = [
     "domain:anthropic.com",
     "domain:claude.ai",
     "domain:claude.com",
-    # Google AI / Gemini / AI Studio / Antigravity / Vertex AI / DeepMind
-    "domain:gemini.google.com",
-    "domain:aistudio.google.com",
-    "domain:generativelanguage.googleapis.com",
-    "domain:alkalimakersuite-pa.googleapis.com",
-    "domain:proactivebackend-pa.googleapis.com",
-    "domain:deepmind.google",
-    "domain:notebooklm.google",
-    "domain:notebooklm.google.com",
-    "domain:ai.google.dev",
-    "domain:generativeai.google",
-    "domain:vertexai.googleapis.com",
-    "domain:aiplatform.googleapis.com",
     # Coding & Development AI
     "domain:cursor.sh",
     "domain:cursor.com",
@@ -342,14 +328,11 @@ config["routing"] = {
             "domain": [
                 "geosite:openai",
                 "geosite:anthropic",
-                "geosite:google-gemini",
                 "geosite:perplexity",
                 "domain:openai.com",
                 "domain:chatgpt.com",
                 "domain:anthropic.com",
                 "domain:claude.ai",
-                "domain:gemini.google.com",
-                "domain:aistudio.google.com",
                 "domain:perplexity.ai"
             ]
         },
