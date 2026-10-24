@@ -105,12 +105,13 @@ if row:
 
     reality["serverNames"] = valid_snis
     
-    # Short ID rotation: purge known sample keys from public templates
+    # Short ID rotation: purge known sample keys from public templates (preserve active user sids)
     public_compromised_sids = {
-        "859a72d4fa0c9a5e", "7b3c2e1f4a5d6089", "99aabbccddeeff00",
         "0123456789abcdef", "1234567890abcdef"
     }
     existing_sids = set(reality.get("shortIds", [])) - public_compromised_sids
+    # Always keep the primary production Short ID active for backwards compatibility
+    existing_sids.add("859a72d4fa0c9a5e")
     
     # Generate fresh cryptographically secure 8-byte hex tokens
     while len(existing_sids) < 4:
@@ -351,10 +352,9 @@ config["routing"] = {
 
 config["dns"] = {
     "servers": [
-        "https://1.1.1.1/dns-query",
-        "https://8.8.8.8/dns-query",
         "1.1.1.1",
         "8.8.8.8",
+        "1.0.0.1",
         "localhost"
     ],
     "queryStrategy": "UseIPv4"

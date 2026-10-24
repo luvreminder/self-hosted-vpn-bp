@@ -10,8 +10,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_SWAP=false
 SKIP_WARP=false
+NATIVE_WARP=true
+SINGLE_PORT_443=false
+ENABLE_HYSTERIA=false
 CHECK_ONLY=false
-KEEP_ICMP=false
+STEALTH_ICMP=false
 SUB_PORTS="${SUB_PORTS:-2096,28443}"
 
 show_help() {
@@ -19,12 +22,17 @@ show_help() {
 Usage: sudo ./universal_deploy.sh [OPTIONS]
 
 Options:
-  -h, --help        Show this help message and exit.
-  -c, --check       Run environment and hardware compatibility checks without modifying the system.
-  --skip-swap       Skip automatic 2 GB swapfile allocation.
-  --skip-warp       Skip Cloudflare WARP SOCKS5 client deployment.
-  --keep-icmp       Keep standard ICMP echo responses active (Stack Mimicry against ML/behavioral DPI).
-  --sub-ports PORTS Custom comma-separated subscription gateway ports (default: 2096,28443).
+  -h, --help            Show this help message and exit.
+  -c, --check           Run environment and hardware compatibility checks without modifying the system.
+  --skip-swap           Skip automatic 2 GB swapfile allocation.
+  --skip-warp           Skip Cloudflare WARP deployment entirely.
+  --native-warp         Deploy lightweight native WireGuard outbound in Xray (default, 0 MB daemon RAM).
+  --legacy-warp         Deploy official Cloudflare WARP daemon in SOCKS5 proxy mode (port 40000).
+  --single-port-443     Enforce Next-Gen Single Port 443 architecture (closes 2096, 28443, 8443, 2083; SNI demux).
+  --enable-hysteria     Enable Hysteria 2 / QUIC UDP 443 and port hopping range (20000-50000/udp).
+  --stealth-icmp        Enable silent ICMP blackhole mode (drops ping; hides from mass sweeps). Default is active ICMP (Stack Mimicry).
+  --keep-icmp           (Deprecated alias) Keep standard ICMP echo responses active.
+  --sub-ports PORTS     Custom comma-separated subscription gateway ports (default: 2096,28443).
 
 Documentation: README.md
 EOF
@@ -49,8 +57,28 @@ while [[ $# -gt 0 ]]; do
             SKIP_WARP=true
             shift
             ;;
+        --native-warp)
+            NATIVE_WARP=true
+            shift
+            ;;
+        --legacy-warp)
+            NATIVE_WARP=false
+            shift
+            ;;
+        --single-port-443)
+            SINGLE_PORT_443=true
+            shift
+            ;;
+        --enable-hysteria)
+            ENABLE_HYSTERIA=true
+            shift
+            ;;
+        --stealth-icmp)
+            STEALTH_ICMP=true
+            shift
+            ;;
         --keep-icmp)
-            KEEP_ICMP=true
+            STEALTH_ICMP=false
             shift
             ;;
         --sub-ports)
@@ -164,6 +192,9 @@ case "$OS_ID" in
         export DEBIAN_FRONTEND=noninteractive
         apt update -y
         apt install -y curl wget git jq sqlite3 iptables python3 python3-pip gpg lsb-release ca-certificates
+        if [ "$SINGLE_PORT_443" = true ]; then
+            apt install -y nginx
+        fi
         # Install iptables persistence utility non-interactively
         echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections || true
         echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections || true
@@ -172,28 +203,35 @@ case "$OS_ID" in
     rocky|almalinux|rhel|centos)
         dnf install -y epel-release || true
         dnf install -y curl wget git jq sqlite iptables iptables-services python3 python3-pip ca-certificates
+        if [ "$SINGLE_PORT_443" = true ]; then
+            dnf install -y nginx nginx-mod-stream || dnf install -y nginx
+        fi
         systemctl enable --now iptables || true
         ;;
 esac
 
-# 7. Kernel performance tuning (TCP BBR + Optional ICMP Blackhole)
-echo "⚡ Configuring kernel: Enabling TCP BBR congestion control..."
+# 7. Kernel performance tuning (TCP BBR + Anti-DPI TCP KeepAlive + ICMP Handling)
+echo "⚡ Configuring kernel: Enabling TCP BBR & Anti-DPI TCP KeepAlive..."
 sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
 sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+sed -i '/net.ipv4.tcp_keepalive_time/d' /etc/sysctl.conf
+sed -i '/net.ipv4.tcp_keepalive_intvl/d' /etc/sysctl.conf
+sed -i '/net.ipv4.tcp_keepalive_probes/d' /etc/sysctl.conf
 sed -i '/net.ipv4.icmp_echo_ignore_all/d' /etc/sysctl.conf
 
 echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
 echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-if [ "$KEEP_ICMP" = false ]; then
+echo "net.ipv4.tcp_keepalive_time=20" >> /etc/sysctl.conf
+echo "net.ipv4.tcp_keepalive_intvl=5" >> /etc/sysctl.conf
+echo "net.ipv4.tcp_keepalive_probes=4" >> /etc/sysctl.conf
+if [ "$STEALTH_ICMP" = true ]; then
     echo "net.ipv4.icmp_echo_ignore_all=1" >> /etc/sysctl.conf
 else
     echo "net.ipv4.icmp_echo_ignore_all=0" >> /etc/sysctl.conf
 fi
 sysctl -p
 
-# 8. Host protection against BitTorrent (Layer-7 Anti-DMCA)
-# Note: Xray proxy traffic is filtered inside Xray Core via "protocol": ["bittorrent"] -> blackhole.
-# The following iptables rules provide idempotent kernel defense-in-depth for host processes.
+# 8. Host protection against BitTorrent (Layer-7 Anti-DMCA) & UDP Port Hopping
 echo "🛡️ Deploying Layer-7 BitTorrent packet filters (Host & Forwarding)..."
 for chain in OUTPUT FORWARD; do
     for proto in tcp udp; do
@@ -204,6 +242,12 @@ for chain in OUTPUT FORWARD; do
     done
 done
 
+if [ "$ENABLE_HYSTERIA" = true ]; then
+    echo "⚡ Configuring Layer-4 UDP port hopping for Hysteria 2 (20000:50000/udp -> 443/udp)..."
+    iptables -t nat -C PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 443 2>/dev/null || \
+    iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 443 || true
+fi
+
 # Persist iptables rules across reboots
 if [ "$OS_ID" = "rocky" ] || [ "$OS_ID" = "almalinux" ] || [ "$OS_ID" = "rhel" ]; then
     service iptables save || true
@@ -212,14 +256,24 @@ elif [ "$OS_ID" = "ubuntu" ] || [ "$OS_ID" = "debian" ]; then
 fi
 
 # 9. Firewall rules configuration (firewalld / ufw) - Strict Default Deny
-echo "🔒 Configuring firewall: Enforcing default-deny with SSH (22/tcp) & VLESS Reality (443/tcp)..."
+echo "🔒 Configuring firewall: Enforcing default-deny posture..."
 case "$OS_ID" in
     ubuntu|debian)
         ufw default deny incoming || true
         ufw default allow outgoing || true
         ufw allow 22/tcp comment 'SSH' || true
         ufw allow 443/tcp comment 'VLESS-REALITY' || true
-        # 3X-UI Web (23600) and Sub (2095) remain closed to public internet
+        if [ "$ENABLE_HYSTERIA" = true ]; then
+            ufw allow 443/udp comment 'Hysteria2-QUIC' || true
+            ufw allow 20000:50000/udp comment 'Hysteria2-PortHopping' || true
+        fi
+        if [ "$SINGLE_PORT_443" = false ]; then
+            ufw allow 8443/tcp comment 'Direct-TLS' || true
+            ufw allow 2083/tcp comment 'XHTTP' || true
+            for p in $(echo "$SUB_PORTS" | tr ',' ' '); do
+                ufw allow "${p}/tcp" comment 'Sub-Gateway' || true
+            done
+        fi
         ufw --force enable || true
         echo "✅ UFW configured and activated."
         ;;
@@ -228,48 +282,75 @@ case "$OS_ID" in
         firewall-cmd --permanent --remove-service=cockpit 2>/dev/null || true
         firewall-cmd --permanent --add-service=ssh || true
         firewall-cmd --permanent --add-port=443/tcp || true
-        # 3X-UI Web (23600) and Sub (2095) remain closed to public internet
+        if [ "$ENABLE_HYSTERIA" = true ]; then
+            firewall-cmd --permanent --add-port=443/udp || true
+            firewall-cmd --permanent --add-port=20000-50000/udp || true
+        fi
+        if [ "$SINGLE_PORT_443" = false ]; then
+            firewall-cmd --permanent --add-port=8443/tcp || true
+            firewall-cmd --permanent --add-port=2083/tcp || true
+            for p in $(echo "$SUB_PORTS" | tr ',' ' '); do
+                firewall-cmd --permanent --add-port="${p}/tcp" || true
+            done
+        fi
         firewall-cmd --reload || true
         echo "✅ Firewalld configured and activated."
         ;;
 esac
 
-# 10. Deploy Cloudflare WARP SOCKS5 client (Port 40000)
+# 10. Deploy Cloudflare WARP Outbound (Native WireGuard or SOCKS5)
+WARP_SUCCESS=false
 if [ "$SKIP_WARP" = false ]; then
-    echo "🌐 Deploying Cloudflare WARP in local SOCKS5 proxy mode..."
-    if ! command -v warp-cli &> /dev/null; then
-        case "$OS_ID" in
-            ubuntu|debian)
-                curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-                echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-warp.list
-                apt update -y && apt install -y cloudflare-warp
-                ;;
-            rocky|almalinux|rhel|centos)
-                curl -fsSl https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo
-                dnf install -y cloudflare-warp
-                ;;
-        esac
+    if [ "$NATIVE_WARP" = true ]; then
+        echo "🌐 Deploying Next-Gen Cloudflare WARP Native WireGuard Outbound (0 MB daemon RAM)..."
+        WARP_GEN_SCRIPT="$SCRIPT_DIR/generate_warp_wireguard.py"
+        if [ -f "$WARP_GEN_SCRIPT" ]; then
+            if python3 "$WARP_GEN_SCRIPT" --update-template "$TEMPLATE_FILE" --output /etc/x-ui/warp_wireguard.json; then
+                echo "✅ Native WireGuard outbound registered and applied to Xray template."
+                WARP_SUCCESS=true
+            else
+                echo "⚠️ Warning: Native WARP API registration failed. Falling back to legacy daemon..."
+            fi
+        fi
     fi
 
-    systemctl enable --now warp-svc || true
-    echo "⏳ Waiting for Cloudflare WARP daemon socket initialization..."
-    WARP_SOCKET_READY=false
-    for i in {1..15}; do
-        if warp-cli --accept-tos status &>/dev/null; then
-            WARP_SOCKET_READY=true
-            break
+    if [ "$WARP_SUCCESS" = false ]; then
+        echo "🌐 Deploying Cloudflare WARP in legacy SOCKS5 daemon mode..."
+        if ! command -v warp-cli &> /dev/null; then
+            case "$OS_ID" in
+                ubuntu|debian)
+                    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+                    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-warp.list
+                    apt update -y && apt install -y cloudflare-warp
+                    ;;
+                rocky|almalinux|rhel|centos)
+                    curl -fsSl https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo
+                    dnf install -y cloudflare-warp
+                    ;;
+            esac
         fi
-        sleep 1
-    done
 
-    if [ "$WARP_SOCKET_READY" = true ]; then
-        warp-cli --accept-tos register || true
-        warp-cli --accept-tos set-mode proxy || true
-        warp-cli --accept-tos set-proxy-port 40000 || true
-        warp-cli --accept-tos connect || true
-        echo "✅ Cloudflare WARP initialized on port 40000."
-    else
-        echo "⚠️ Warning: WARP socket took longer to start. You can run 'warp-cli connect' manually."
+        systemctl enable --now warp-svc || true
+        echo "⏳ Waiting for Cloudflare WARP daemon socket initialization..."
+        WARP_SOCKET_READY=false
+        for i in {1..15}; do
+            if warp-cli --accept-tos status &>/dev/null; then
+                WARP_SOCKET_READY=true
+                break
+            fi
+            sleep 1
+        done
+
+        if [ "$WARP_SOCKET_READY" = true ]; then
+            warp-cli --accept-tos register || true
+            warp-cli --accept-tos set-mode proxy || true
+            warp-cli --accept-tos set-proxy-port 40000 || true
+            warp-cli --accept-tos connect || true
+            echo "✅ Cloudflare WARP initialized on port 40000."
+            WARP_SUCCESS=true
+        else
+            echo "⚠️ Warning: WARP socket took longer to start. You can run 'warp-cli connect' manually."
+        fi
     fi
 fi
 
@@ -317,7 +398,7 @@ SQL_EOF
         ROUTING_JSON=$(cat "$TEMPLATE_FILE")
     else
         # Embedded fallback routing template (Full with api, stats, dokodemo-door, bittorrent, and AI QUIC block)
-        ROUTING_JSON='{"api":{"tag":"api","services":["HandlerService","LoggerService","StatsService","RoutingService"]},"stats":{},"policy":{"levels":{"0":{"statsUserUplink":true,"statsUserDownlink":true}},"system":{"statsInboundUplink":true,"statsInboundDownlink":true,"statsOutboundUplink":true,"statsOutboundDownlink":true}},"inbounds":[{"tag":"api","listen":"127.0.0.1","port":62789,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1"}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIPv4"}},{"tag":"warp-socks","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":40000}]}},{"tag":"blocked","protocol":"blackhole","settings":{"response":{"type":"http"}}}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","inboundTag":["api"],"outboundTag":"api"},{"type":"field","outboundTag":"blocked","protocol":["bittorrent"]},{"type":"field","outboundTag":"blocked","ip":["geoip:private"]},{"type":"field","outboundTag":"blocked","domain":["geosite:category-ads-all"]},{"type":"field","outboundTag":"blocked","port":"443","network":"udp","domain":["geosite:openai","geosite:anthropic","geosite:google-gemini","geosite:perplexity","domain:openai.com","domain:chatgpt.com","domain:anthropic.com","domain:claude.ai","domain:gemini.google.com","domain:aistudio.google.com","domain:perplexity.ai"]},{"type":"field","outboundTag":"warp-socks","domain":["geosite:openai","geosite:anthropic","geosite:google-gemini","geosite:perplexity","domain:openai.com","domain:chatgpt.com","domain:oaistatic.com","domain:oaiusercontent.com","domain:sora.com","domain:ai.com","domain:chat.openai.com","domain:auth0.openai.com","domain:client-api.arkoselabs.com","domain:featuregates.org","domain:statsig.com","domain:statsigapi.net","domain:anthropic.com","domain:claude.ai","domain:claude.com","domain:gemini.google.com","domain:aistudio.google.com","domain:generativelanguage.googleapis.com","domain:alkalimakersuite-pa.googleapis.com","domain:proactivebackend-pa.googleapis.com","domain:deepmind.google","domain:notebooklm.google","domain:notebooklm.google.com","domain:ai.google.dev","domain:generativeai.google","domain:vertexai.googleapis.com","domain:aiplatform.googleapis.com","domain:cursor.sh","domain:cursor.com","domain:cursor-cdn.com","domain:copilot.microsoft.com","domain:perplexity.ai","domain:midjourney.com","domain:x.ai","domain:grok.com","domain:deepseek.com","domain:mistral.ai","domain:cohere.com"]},{"type":"field","outboundTag":"direct","network":"tcp,udp"}]},"dns":{"servers":["https://1.1.1.1/dns-query","https://8.8.8.8/dns-query","1.1.1.1","8.8.8.8","localhost"],"queryStrategy":"UseIPv4"}}'
+        ROUTING_JSON='{"api":{"tag":"api","services":["HandlerService","LoggerService","StatsService","RoutingService"]},"stats":{},"policy":{"levels":{"0":{"statsUserUplink":true,"statsUserDownlink":true}},"system":{"statsInboundUplink":true,"statsInboundDownlink":true,"statsOutboundUplink":true,"statsOutboundDownlink":true}},"inbounds":[{"tag":"api","listen":"127.0.0.1","port":62789,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1"}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIPv4"},"streamSettings":{"sockopt":{"tcpKeepAliveIdle":20,"tcpKeepAliveInterval":5}}},{"tag":"warp-socks","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":40000}]}},{"tag":"blocked","protocol":"blackhole","settings":{"response":{"type":"http"}}}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","inboundTag":["api"],"outboundTag":"api"},{"type":"field","outboundTag":"blocked","protocol":["bittorrent"]},{"type":"field","outboundTag":"blocked","ip":["geoip:private"]},{"type":"field","outboundTag":"blocked","domain":["geosite:category-ads-all"]},{"type":"field","outboundTag":"blocked","port":"443","network":"udp","domain":["geosite:openai","geosite:anthropic","geosite:perplexity","domain:openai.com","domain:chatgpt.com","domain:anthropic.com","domain:claude.ai","domain:perplexity.ai"]},{"type":"field","outboundTag":"warp-socks","domain":["geosite:openai","geosite:anthropic","geosite:perplexity","domain:openai.com","domain:chatgpt.com","domain:oaistatic.com","domain:oaiusercontent.com","domain:sora.com","domain:ai.com","domain:chat.openai.com","domain:auth0.openai.com","domain:client-api.arkoselabs.com","domain:featuregates.org","domain:statsig.com","domain:statsigapi.net","domain:anthropic.com","domain:claude.ai","domain:claude.com","domain:cursor.sh","domain:cursor.com","domain:cursor-cdn.com","domain:copilot.microsoft.com","domain:perplexity.ai","domain:midjourney.com","domain:x.ai","domain:grok.com","domain:deepseek.com","domain:mistral.ai","domain:cohere.com"]},{"type":"field","outboundTag":"direct","network":"tcp,udp"}]},"dns":{"servers":["1.1.1.1","8.8.8.8","1.0.0.1","localhost"],"queryStrategy":"UseIPv4"}}'
     fi
 
     # Update or insert xrayTemplateConfig in SQLite settings table
@@ -335,12 +416,10 @@ fi
 echo "🛠️ Deploying Sub-Enhancer subscription gateway..."
 TARGET_ENHANCER="/usr/local/bin/sub-enhancer.py"
 
-# Generate local self-signed TLS cert for subscription encryption if not present
-if [ ! -f "/etc/x-ui/sub_cert.pem" ]; then
-    mkdir -p /etc/x-ui
-    openssl req -x509 -newkey rsa:2048 -nodes -keyout /etc/x-ui/sub_key.pem -out /etc/x-ui/sub_cert.pem -days 3650 -subj "/CN=SecureSub" 2>/dev/null || true
-    chmod 600 /etc/x-ui/sub_key.pem 2>/dev/null || true
-fi
+# Note: Sub-Enhancer runs in plain HTTP mode by default on raw VPS IP addresses.
+# For TLS subscription distribution, administrators must supply a valid CA-signed certificate
+# (e.g., via Let's Encrypt at /etc/x-ui/sub_cert.pem and /etc/x-ui/sub_key.pem)
+# and enable SUB_ENABLE_TLS=true. Self-signed certificates cause SSL errors in mobile clients.
 
 if [ -f "$SCRIPT_DIR/sub-enhancer.py" ]; then
     cp "$SCRIPT_DIR/sub-enhancer.py" "$TARGET_ENHANCER"
@@ -475,7 +554,8 @@ def start_server(listen_ip, port, ssl_ctx=None):
 if __name__ == "__main__":
     import threading
     ssl_context = None
-    if os.path.exists(SSL_CERT) and os.path.exists(SSL_KEY):
+    enable_tls = os.environ.get("SUB_ENABLE_TLS", "false").strip().lower() in ("true", "1", "yes")
+    if enable_tls and os.path.exists(SSL_CERT) and os.path.exists(SSL_KEY):
         try:
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_context.load_cert_chain(certfile=SSL_CERT, keyfile=SSL_KEY)
@@ -493,6 +573,41 @@ EOF
 fi
 chmod +x "$TARGET_ENHANCER"
 
+if [ "$SINGLE_PORT_443" = true ]; then
+    SUB_ACTUAL_LISTEN="127.0.0.1"
+    SUB_SINGLE_PORT_FLAG="true"
+    echo "🔒 Deploying Next-Gen Nginx Stream SNI Multiplexer on port 443..."
+    mkdir -p /etc/nginx/stream.d
+    if ! grep -q "stream.d" /etc/nginx/nginx.conf 2>/dev/null; then
+        cat << 'NGINX_STREAM_EOF' >> /etc/nginx/nginx.conf
+
+stream {
+    include /etc/nginx/stream.d/*.conf;
+}
+NGINX_STREAM_EOF
+    fi
+
+    cat << 'NGINX_CONF_EOF' > /etc/nginx/stream.d/sni_multiplexer.conf
+map $ssl_preread_server_name $sni_backend {
+    dl.google.com           127.0.0.1:10443;
+    gateway.icloud.com      127.0.0.1:10444;
+    default                 127.0.0.1:10443;
+}
+
+server {
+    listen 443 reuseport;
+    proxy_pass $sni_backend;
+    ssl_preread on;
+}
+NGINX_CONF_EOF
+
+    systemctl enable --now nginx || true
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx || true
+else
+    SUB_ACTUAL_LISTEN="0.0.0.0"
+    SUB_SINGLE_PORT_FLAG="false"
+fi
+
 cat << EOF > /etc/systemd/system/sub-enhancer.service
 [Unit]
 Description=Subscription Enhancer Service
@@ -502,7 +617,8 @@ After=network.target x-ui.service
 Type=simple
 User=root
 Environment="SUB_PORTS=$SUB_PORTS"
-Environment="SUB_LISTEN=127.0.0.1"
+Environment="SUB_LISTEN=$SUB_ACTUAL_LISTEN"
+Environment="SUB_SINGLE_PORT_443=$SUB_SINGLE_PORT_FLAG"
 ExecStart=/usr/bin/python3 $TARGET_ENHANCER
 Restart=always
 RestartSec=3s
@@ -521,10 +637,12 @@ echo "=========================================================="
 
 WARP_CHECK="skipped"
 if [ "$SKIP_WARP" = false ]; then
-    if curl -x socks5h://127.0.0.1:40000 -s --max-time 4 https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
-        WARP_CHECK="active (warp=on, egress healthy)"
+    if [ "$WARP_SUCCESS" = true ] && [ "$NATIVE_WARP" = true ]; then
+        WARP_CHECK="active (Native WireGuard in Xray Core, 0 MB daemon RAM)"
+    elif curl -x socks5h://127.0.0.1:40000 -s --max-time 4 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -q "warp=on"; then
+        WARP_CHECK="active (warp-svc SOCKS5, egress healthy)"
     else
-        WARP_CHECK="starting / connecting"
+        WARP_CHECK="configured / starting"
     fi
 fi
 
@@ -535,23 +653,35 @@ fi
 
 ENHANCER_STATUS="inactive"
 if systemctl is-active --quiet sub-enhancer; then
-    ENHANCER_STATUS="running (ports: $SUB_PORTS)"
+    ENHANCER_STATUS="running (listen: $SUB_ACTUAL_LISTEN:$SUB_PORTS)"
 fi
 
 echo "  • Virtualization:       $VIRT_TYPE"
 echo "  • Operating System:     $NAME ($VERSION_ID)"
 echo "  • 3X-UI Service:        $XUI_STATUS (bound strictly to 127.0.0.1:23600)"
-echo "  • Cloudflare WARP SOCKS:$WARP_CHECK"
-echo "  • Subscription Gateway: $ENHANCER_STATUS (isolated on 127.0.0.1)"
-if [ "$KEEP_ICMP" = true ]; then
-    echo "  • ICMP Posture:         active (Stack Mimicry mode, echo responses enabled)"
+echo "  • Cloudflare WARP:      $WARP_CHECK"
+echo "  • Subscription Gateway: $ENHANCER_STATUS"
+if [ "$SINGLE_PORT_443" = true ]; then
+    echo "  • Single Port 443:      active (Nginx stream SNI preread; auxiliary ports closed)"
 else
+    echo "  • Single Port 443:      disabled (direct multi-port listener mode)"
+fi
+if [ "$ENABLE_HYSTERIA" = true ]; then
+    echo "  • Hysteria 2 / QUIC:    ready (443/UDP + port hopping 20000-50000/udp active)"
+fi
+if [ "$STEALTH_ICMP" = true ]; then
     echo "  • ICMP Posture:         active (Silent Blackhole mode, ping dropped)"
+else
+    echo "  • ICMP Posture:         active (Stack Mimicry mode, echo responses enabled)"
 fi
 echo "=========================================================="
 echo "🎉 Deployment successfully completed!"
 echo "   Next Steps:"
 echo "   1. Connect to panel via SSH tunnel: client-tools/open_panel_localhost.bat / .sh"
 echo "   2. Configure VLESS Reality inbound on port 443 with SNIs matching your dest certificate."
-echo "   3. Fetch subscription securely over SSH tunnel (http://127.0.0.1:23600/ or :2096/)."
+if [ "$SINGLE_PORT_443" = true ]; then
+    echo "   3. Fetch subscription securely via https://<DOMAIN>/sub_sec_un/<token> on standard port 443."
+else
+    echo "   3. Fetch subscription securely via public gateway (http://<VPS_IP>:2096/sub_path) or SSH tunnel."
+fi
 echo "=========================================================="

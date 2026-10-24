@@ -27,13 +27,13 @@ Deploying a secure, censorship-resistant personal proxy or VPN infrastructure us
 ### How This Blueprint Helps
 This specification represents a complete, hardened **Golden Standard reference architecture** that resolves each of these vulnerabilities:
 
-* **Production-Grade Isolation:** The 3X-UI panel is bound strictly to `localhost` and accessible only through an encrypted SSH tunnel. The server operates in an ICMP blackhole mode (ignoring ping probes).
+* **Production-Grade Isolation:** The 3X-UI panel is bound strictly to `localhost` and accessible only through an encrypted SSH tunnel. The server operates in Stack Mimicry mode (active ICMP echo responses for client speedometer accuracy and middlebox camouflage) or optional Silent Blackhole mode.
 * **Intelligent Outbound Split-Routing:** High-performance direct egress for streaming, gaming, and general web browsing, combined with transparent, selective routing through a local Cloudflare WARP SOCKS5 proxy (`127.0.0.1:40000`) exclusively for AI platforms.
 * **Multi-SNI Disguise Profiles:** Independent server masquerades tailored for cellular networks and broadband Wi-Fi, strictly validated against the target server's SAN certificate.
 * **Automated Subscription Gateway (`sub-enhancer`):** An autonomous background daemon that resolves dynamic node labels from SQLite, normalizes URL input errors, enforces localhost / TLS isolation, and injects automatic 12-hour background refresh headers.
 * **Host & Protocol Abuse Protection:** Dual-tier anti-BitTorrent protection combining Xray Core deep protocol sniffing (`protocol: ["bittorrent"] -> blackhole`) with kernel-level packet filters.
 * **Universal Compatibility:** Fully tested across modern enterprise Linux (Rocky Linux 9, AlmaLinux 9) and Debian-family releases (Ubuntu 22.04/24.04, Debian 12).
-* **Active Probing Defense & Comprehensive Stealth:** Full ICMP blackhole mode (ignoring ping sweeps) coupled with VLESS Reality cryptographic fallback to genuine Apple and Google TLS 1.3 endpoints. Unauthenticated probes receive authentic third-party SSL certificates, while uTLS and XTLS-Vision neutralize heuristic DPI fingerprinting.
+* **Active Probing Defense & Comprehensive Stealth:** Stack Mimicry defense (active ICMP echo for client latency benchmarks, or optional Silent Blackhole) coupled with VLESS Reality cryptographic fallback to genuine Apple and Google TLS 1.3 endpoints. Unauthenticated probes receive authentic third-party SSL certificates, while uTLS and XTLS-Vision neutralize heuristic DPI fingerprinting.
 
 ### 📦 Repository & Community Edition Contents
 This repository distribution bundle includes:
@@ -60,11 +60,12 @@ This repository distribution bundle includes:
 * [🧭 3. Architectural Design Rationale](#-3-architectural-design-rationale)
   * [3.1. Deep Analysis: Scanner Detection, Active Probing & Censorship Resistance](#31-deep-analysis-scanner-detection-active-probing--censorship-resistance)
   * [3.2. Advanced Anti-Fingerprinting & Evasion Hardening](#32-advanced-anti-fingerprinting--evasion-hardening)
+  * [3.3. State-of-the-Art (SOTA) DPI Evasion: Mitigating L7 Behavioral Flow Analysis & Stream Freezes](#33-state-of-the-art-sota-dpi-evasion-mitigating-l7-behavioral-flow-analysis--stream-freezes)
 * [🛠️ 4. Step-by-Step Deployment Procedure](#️-4-step-by-step-deployment-procedure)
   * [Step 0: Swap Allocation](#step-0-swap-allocation-crucial-for-1-gb-ram-nodes)
   * [Step 1: Kernel Performance & Stealth](#step-1-kernel-performance--stealth-configuration)
   * [Step 2: Layer-7 BitTorrent Filtering](#step-2-layer-7-bittorrent-filtering-anti-dmca)
-  * [Step 3: Deploy Cloudflare WARP SOCKS5](#step-3-deploy-cloudflare-warp-socks5-gateway)
+  * [Step 3: Deploy Cloudflare WARP Egress (Native WireGuard / SOCKS5)](#step-3-deploy-cloudflare-warp-egress-for-ai-platforms)
   * [Step 4: Install 3X-UI & Isolate Panel Access](#step-4-install-3x-ui--isolate-panel-access)
   * [Step 5: Configure Xray Core Routing](#step-5-configure-xray-core-routing-xraytemplateconfig)
   * [Step 6: Configure VLESS Reality & Multi-SNI Endpoints](#step-6-configure-vless-reality--multi-sni-endpoints)
@@ -81,6 +82,7 @@ This repository distribution bundle includes:
   * [6.4. Database Backup Strategy](#64-database-backup-strategy)
   * [6.5. Troubleshooting Runbook](#65-troubleshooting-runbook)
   * [6.6. Verification of Server Stealth & Scanner Invisibility](#66-verification-of-server-stealth--scanner-invisibility-audit-runbook)
+  * [6.7. Operational Best Practices: Critical Dos and Don'ts](#67-operational-best-practices-critical-dos-and-donts)
 * [🔄 7. Routine & Monthly VPS Maintenance Runbook](#-7-routine--monthly-vps-maintenance-runbook)
 * [📄 License](#-license)
 * [⚠️ Educational Disclaimer & Operational Liability Notice](#️-educational-disclaimer--operational-liability-notice)
@@ -239,6 +241,117 @@ To prevent automated censorship systems and DPI middleboxes from developing heur
 
 ---
 
+### 3.3. State-of-the-Art (SOTA) DPI Evasion: Mitigating L7 Behavioral Flow Analysis & Stream Freezes
+
+In adversarial censorship environments and restrictive national firewall perimeters, state-level censorship appliances have advanced far beyond traditional static IP blacklists and TLS SNI string matching. Modern Deep Packet Inspection (DPI) platforms actively utilize **Layer-7 Behavioral Flow Analysis** and state-table timeout manipulation. Understanding these failure modes and deploying state-of-the-art countermeasures is essential for maintaining perpetual tunnel availability.
+
+#### 1. The "16 KB Stream Freeze" Failure Mode in Raw TCP Reality
+* **The Failure Mechanism:** A client successfully establishes a classic `VLESS + TCP + Reality` (with `xtls-rprx-vision`) connection. The initial TLS 1.3 handshake is cryptographically indistinguishable from the target disguise server (`dest`) and completes in ~100 ms. However, as soon as continuous application data flows over the raw TCP socket (typically after 16 KB to 64 KB of payload transfer), L7 DPI flow-inspection engines analyze the packet size distribution, timing intervals, and long-lived continuous data streams to a commercial datacenter IP.
+* **The Symptom:** Rather than injecting an overt `TCP RST`, the middlebox **silently drops subsequent TCP data packets**. On the server, executing `ss -tnp` reveals a clogged `Send-Q` backlog containing un-acknowledged bytes. On the client workstation, browser requests hang indefinitely and time out (`HTTP 000` / `ERR_TIMED_OUT`), while speed tests report `n/a`.
+* **SOTA Countermeasure — VLESS + XHTTP (SplitHTTP v2) over Reality & TLS:**
+  * In modern Xray Core (v25+ / v26+), **XHTTP** is the official next-generation anti-censorship transport, superseding legacy WebSocket and gRPC.
+  * Instead of maintaining an exposed, raw TCP stream, XHTTP fragments proxy payload into discrete, genuine HTTP/2 request-response pairs with randomized chunk padding (`mode: auto`).
+  * Combining `network: xhttp` with `security: reality` provides the gold standard: the initial connection mimics authentic third-party TLS certificates, while subsequent traffic flows inside standard HTTP/2 multiplexed streams that completely neutralize the middlebox "16 KB raw TCP stream freeze".
+
+#### 2. The TCP KeepAlive Desync Trap & Idle Connection Resets
+* **The Failure Mechanism:** Default Linux distributions configure the kernel TCP keepalive timeout to `net.ipv4.tcp_keepalive_time = 7200` (2 hours). However, stateful middleboxes (such as ISP DPI boxes, carrier-grade NATs, and national firewalls) maintain active connection tracking tables with aggressive expiration windows of **30 to 60 seconds**.
+* **The Symptom:** Whenever a user pauses browsing (e.g. reading an article for 45 seconds), the middlebox purges the connection tracking state. When the server or client transmits the next packet, the middlebox treats it as an untracked packet and immediately injects a **`TCP RST` (Connection Reset by Peer)**. Users experience constant, frustrating disconnections even on functional protocols.
+* **SOTA Countermeasure — Anti-DPI Kernel Tuning & Socket KeepAlive:**
+  * Configure aggressive kernel-level TCP keepalive probes so that idle connections emit lightweight probe frames every 20 seconds, preventing middlebox state table eviction:
+    ```ini
+    net.ipv4.tcp_keepalive_time = 20
+    net.ipv4.tcp_keepalive_intvl = 5
+    net.ipv4.tcp_keepalive_probes = 4
+    ```
+  * In Xray inbound configurations, set `streamSettings.sockopt`:
+    ```json
+    "sockopt": {
+      "tcpKeepAliveInterval": 15,
+      "tcpKeepAliveIdle": 15,
+      "tcpUserTimeout": 10000
+    }
+    ```
+
+#### 3. Dynamic DNS (DDNS) Flakiness & ISP DNS Poisoning
+* **The Failure Mechanism:** Deploying personal server endpoints via third-party dynamic DNS services introduces a fragile external dependency. Public DDNS subdomains have near-zero TTLs and are heavily targeted by restrictive ISPs with DNS throttling, packet drops, or synthetic NXDOMAIN poisoning.
+* **The Symptom:** Client applications attempting to reconnect or perform periodic health checks fail with domain resolution timeouts, severing active proxy tunnels.
+* **SOTA Countermeasure — Direct IP Endpoints with Preserved TLS SNI:**
+  * Configure the subscription gateway (`sub-enhancer`) to emit direct server IPv4 addresses as the connection endpoint in client URLs (`vless://uuid@<SERVER_IP>:port?...`), while preserving the authentic domain inside the `sni` parameter.
+  * The client connects directly to the IP address with zero DNS overhead or poisoning risk, while the TLS handshake negotiates and verifies the genuine domain certificate without errors.
+
+#### 4. The ICMP Blackhole vs Client Latency Measurement Dilemma
+* **The Conflict:** Complete ICMP echo suppression (`net.ipv4.icmp_echo_ignore_all = 1`) protects servers from automated wide-area ping scanners. However, popular modern proxy clients (such as Happ, v2rayN, and Shadowrocket) evaluate subscription node health and latency by dispatching **ICMP Echo (Ping) probes**.
+* **The Symptom:** When ICMP is discarded, client latency tests report `n/a` (Not Available) for all unselected nodes, misleading users into believing the infrastructure is offline.
+* **SOTA Countermeasure — Controlled ICMP Echo:**
+  * Enable ICMP echo replies (`net.ipv4.icmp_echo_ignore_all = 0`) to provide instant, accurate latency benchmarks in client applications, while relying on loopback binding, secret token URIs, and firewall rules to protect administrative interfaces.
+
+#### 5. Advanced XHTTP XMUX Session Rotation & Asymmetric Routing
+* **The Failure Mechanism:** Long-lived HTTP/2 streams that transfer sustained volume over a single persistent TCP connection trigger behavioral flow heuristics in state-level Layer-7 DPI appliances. Legitimate web browsing consists of transient connections that cycle periodically.
+* **SOTA Countermeasure — `xmux` Multiplexing Control:**
+  Configure the `xmux` parameters in `xhttpSettings`:
+  ```json
+  "xmux": {
+    "maxConcurrency": 16,
+    "cMaxReuseTimes": 600,
+    "cMaxLifetimeMs": 1800000,
+    "hMaxRequestTimes": 800,
+    "hMaxReusableSecs": 2400
+  }
+  ```
+  Xray smoothly recycles TCP/TLS connections every 600–800 requests or 30–40 minutes in the background without dropping user sessions, perfectly mimicking organic browser traffic.
+* **Asymmetric Up/Down Routing (Bypassing 16KB Host Subnet Filters):**
+  When DPI applies aggressive RST filtering to outbound connections targeting foreign VPS subnets (the "16KB host filter"), XHTTP allows separating flows:
+  - **Uplink:** Client requests route via Cloudflare / CDN using `packet-up` over HTTP/3 QUIC.
+  - **Downlink:** High-throughput server responses return directly to the client.
+  Because DPI observes only unidirectional flows towards disparate IP addresses, bidirectional session analysis fails completely.
+
+#### 6. Single Port 443 Architecture (SNI Router & Multiplexer)
+* **The Failure Mechanism:** Exposing a constellation of auxiliary ports (`443`, `8443`, `2083`, `2096`, `28443`) on a single VPS IP creates a signature fingerprint readily indexed by automated Internet scanners (Censys, Shodan) and DPI categorizers.
+* **SOTA Countermeasure — Layer-4 SNI Preread Multiplexing:**
+  Only port 443 (and SSH) is exposed publicly. Nginx runs with `ssl_preread on;` in a `stream` block, reading the TLS ClientHello SNI without terminating encryption:
+  - `SNI = dl.google.com`: Forwarded to Inbound #1 (Reality with `dest: dl.google.com:443`).
+  - `SNI = gateway.icloud.com`: Forwarded to Inbound #2 (Reality with `dest: gateway.icloud.com:443`). Multi-SNI across distinct corporations on port 443 with zero SAN certificate conflicts!
+  - `SNI = yourdomain.com`: Forwarded to local web server (Nginx HTTP/2 terminating with Let's Encrypt), which serves a genuine decoy website at `/`, handles VLESS XHTTP over a secret path, and reverse-proxies `/sub_sec_un/` to Sub-Enhancer (`127.0.0.1:2096`) over trusted HTTPS on standard port 443!
+  - Auxiliary ports `2096`, `28443`, `8443`, and `2083` are bound exclusively to `127.0.0.1` and permanently closed in the external firewall.
+
+#### 7. Native Userspace WireGuard Outbound in Xray Core (Eliminating `warp-svc`)
+* **The Problem with `warp-svc`:** The official Cloudflare WARP client daemon consumes ~100 MB RAM, requires kernel `tun` modules and DBus, conflicts with older glibc libraries, and suffers UDP dropouts in SOCKS5 mode (forcing operators to block UDP 443 / QUIC for AI domains).
+* **SOTA Countermeasure — Native Userspace WireGuard in Xray Core:**
+  Xray Core natively supports `"protocol": "wireguard"` in outbounds without external daemons. Using the included `generate_warp_wireguard.py` helper, a free Cloudflare WARP account is registered via API in 1 second, extracting `privateKey`, assigned IPv4/IPv6, peer public key, and the mandatory 3 `reserved` bytes.
+  - **0 MB Background Daemon RAM:** No external packages or services needed.
+  - **Native UDP & QUIC Support:** Eliminates the need to block QUIC (UDP:443) for AI services.
+  - **Universal Virtualization Support:** Operates seamlessly even in restricted LXC / OpenVZ containers where `/dev/net/tun` is unavailable.
+
+#### 8. Client-Side TLS Hello Fragmentation (`fragment`) for Direct TLS
+* **The Failure Mechanism:** Generic dynamic DNS hostnames or unlisted personal domains often have their domain strings targeted via regex pattern matching in the unencrypted TLS ClientHello packet.
+* **SOTA Countermeasure — TLS Hello Packet Segmentation:**
+  Xray Core and compatible clients support outbound TLS fragmentation:
+  ```json
+  "fragment": {
+    "packets": "tlshello",
+    "length": "10-20",
+    "interval": "10-15"
+  }
+  ```
+  By segmenting the initial TLS ClientHello packet into 10–20 byte TCP fragments separated by 10–15 ms, the plaintext SNI string is broken across multiple TCP packets. High-speed wire DPI hardware cannot reassemble fragmented TCP segments at multi-gigabit line rate, bypassing domain filtering without throughput penalty.
+
+#### 9. Stack Mimicry: Why `icmp_echo_ignore_all = 0` Outperforms Ping Suppression
+* **Modern Scanner Reality:** Global IP scanners (Censys, Shodan, ZMap) scan the entire IPv4 space directly with TCP SYN probes to port 443 (`-Pn`), ignoring ICMP ping completely.
+* **DPI ML Heuristics:** Legitimate edge nodes (Google, Apple, Cloudflare) universally respond to ICMP Echo. A server that silently drops ICMP while presenting an open TCP 443 port presents an obvious TCP/IP stack anomaly to behavioral classifiers.
+* **The Resolution:** Maintain `net.ipv4.icmp_echo_ignore_all = 0` (Stack Mimicry) for client speed test compatibility and realistic edge behavior, while relying strictly on Single Port 443 and localhost binding to prevent reconnaissance discovery.
+
+#### 10. Alternative UDP Transport: Hysteria 2 / QUIC with Layer-4 Port Hopping
+* **The Problem with Pure TCP:** Under aggressive cellular throttling, mobile handoffs, or severe packet loss (5–15%), TCP tunnels suffer from TCP Meltdown and Head-of-Line blocking.
+* **SOTA Countermeasure — Hysteria 2 Coexistence on Port 443/UDP:**
+  Because TCP and UDP maintain distinct socket namespaces in Linux, **port 443/TCP (VLESS Reality / XHTTP) and port 443/UDP (Hysteria 2 QUIC) run concurrently on the exact same port 443 without collision**.
+  - **Brutal Congestion Control:** Maintains maximum link throughput even under 15–20% packet loss.
+  - **iptables Port Hopping:** Evades dynamic UDP port throttling by mapping ports 20000–50000 to port 443:
+    ```bash
+    iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 443
+    ```
+
+---
+
 ## 🛠️ 4. Step-by-Step Deployment Procedure
 
 ### Step 0: Swap Allocation (Crucial for 1 GB RAM Nodes)
@@ -255,7 +368,7 @@ fi
 
 ---
 
-### Step 1: Kernel Performance & Stealth Configuration
+### Step 1: Kernel Performance & Anti-DPI Tuning
 1. **Enable TCP BBR & Fair Queueing:**
    ```bash
    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
@@ -263,12 +376,29 @@ fi
    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
    ```
-2. **Enable ICMP Blackhole (Stealth Mode):**
+2. **Apply Anti-DPI TCP KeepAlive Tuning:**
+   Prevents middlebox connection-tracking table expiration and eliminates random TCP RST resets during idle periods:
    ```bash
-   sed -i '/net.ipv4.icmp_echo_ignore_all/d' /etc/sysctl.conf
-   echo "net.ipv4.icmp_echo_ignore_all=1" >> /etc/sysctl.conf
-   sysctl -p
+   sed -i '/net.ipv4.tcp_keepalive_time/d' /etc/sysctl.conf
+   sed -i '/net.ipv4.tcp_keepalive_intvl/d' /etc/sysctl.conf
+   sed -i '/net.ipv4.tcp_keepalive_probes/d' /etc/sysctl.conf
+   echo "net.ipv4.tcp_keepalive_time=20" >> /etc/sysctl.conf
+   echo "net.ipv4.tcp_keepalive_intvl=5" >> /etc/sysctl.conf
+   echo "net.ipv4.tcp_keepalive_probes=4" >> /etc/sysctl.conf
    ```
+3. **Configure ICMP Ping Handling:**
+   * *Stack Mimicry & Client Latency Mode (Default — Recommended for client app speedometers and middlebox camouflage):*
+     ```bash
+     sed -i '/net.ipv4.icmp_echo_ignore_all/d' /etc/sysctl.conf
+     echo "net.ipv4.icmp_echo_ignore_all=0" >> /etc/sysctl.conf
+     sysctl -p
+     ```
+   * *Silent Blackhole Mode (Optional for mass-scanner evasion):*
+     ```bash
+     sed -i '/net.ipv4.icmp_echo_ignore_all/d' /etc/sysctl.conf
+     echo "net.ipv4.icmp_echo_ignore_all=1" >> /etc/sysctl.conf
+     sysctl -p
+     ```
 
 ---
 
@@ -291,9 +421,18 @@ iptables -I FORWARD -p udp -m string --string "BitTorrent" --algo bm -j DROP
 
 ---
 
-### Step 3: Deploy Cloudflare WARP SOCKS5 Gateway
-Install the official `cloudflare-warp` daemon:
+### Step 3: Deploy Cloudflare WARP Egress for AI Platforms
 
+#### Option A: Next-Gen Native Userspace WireGuard in Xray Core (Recommended)
+This approach eliminates the `cloudflare-warp` daemon, saving ~100 MB of RAM, resolving glibc conflicts, and providing full UDP/QUIC forwarding for AI services:
+```bash
+# Generate WireGuard keys and register with Cloudflare client API
+python3 generate_warp_wireguard.py --update-template xray_template_config.json --output /etc/x-ui/warp_wireguard.json
+```
+*Validation:* Verify `/etc/x-ui/warp_wireguard.json` is generated with `tag: warp-wireguard`, assigned IPv4/IPv6, and 3-byte `reserved` parameters.
+
+#### Option B: Legacy Cloudflare WARP SOCKS5 Daemon (Fallback)
+If manual daemon management is preferred:
 * **For Rocky Linux 9 / AlmaLinux 9:**
   ```bash
   curl -fsSl https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | tee /etc/yum.repos.d/cloudflare-warp.repo
@@ -315,7 +454,7 @@ warp-cli --accept-tos set-mode proxy
 warp-cli --accept-tos set-proxy-port 40000
 warp-cli --accept-tos connect
 ```
-*Validation:* Verify the output of `curl -x socks5h://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace | grep warp` returns `warp=on`.
+*Validation:* Verify `curl -x socks5h://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace | grep warp` returns `warp=on`.
 
 ---
 
@@ -338,15 +477,19 @@ INSERT INTO settings (key, value) VALUES ('subEnable', 'true') ON CONFLICT(key) 
 INSERT INTO settings (key, value) VALUES ('subPath', '/sub/') ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 EOF
 
-# Enforce default-deny firewall (only SSH and port 443 open to the public)
-# For Ubuntu / Debian:
+# Option 1: Next-Gen Single Port 443 Firewall (Recommended)
+# Exposes ONLY Port 443 (TCP/UDP) and SSH (22/tcp). All other services multiplex internally.
 ufw default deny incoming && ufw default allow outgoing
 ufw allow 22/tcp comment 'SSH'
-ufw allow 443/tcp comment 'VLESS-REALITY'
+ufw allow 443/tcp comment 'VLESS-REALITY-443'
+ufw allow 443/udp comment 'Hysteria2-QUIC-443'
 ufw --force enable
 
-# For Rocky / AlmaLinux:
-# systemctl enable --now firewalld && firewall-cmd --permanent --add-service=ssh && firewall-cmd --permanent --add-port=443/tcp && firewall-cmd --reload
+# Option 2: Legacy Multi-Port Firewall (Direct Listeners)
+# ufw allow 8443/tcp comment 'Direct-TLS'
+# ufw allow 2083/tcp comment 'XHTTP'
+# ufw allow 2096/tcp comment 'Sub-Gateway'
+# ufw allow 28443/tcp comment 'Sub-Gateway-Alt'
 
 systemctl start x-ui
 ```
@@ -403,6 +546,12 @@ Apply the hardened Xray configuration template directing selected AI platforms t
       "protocol": "freedom",
       "settings": {
         "domainStrategy": "UseIPv4"
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tcpKeepAliveIdle": 20,
+          "tcpKeepAliveInterval": 5
+        }
       }
     },
     {
@@ -466,14 +615,11 @@ Apply the hardened Xray configuration template directing selected AI platforms t
         "domain": [
           "geosite:openai",
           "geosite:anthropic",
-          "geosite:google-gemini",
           "geosite:perplexity",
           "domain:openai.com",
           "domain:chatgpt.com",
           "domain:anthropic.com",
           "domain:claude.ai",
-          "domain:gemini.google.com",
-          "domain:aistudio.google.com",
           "domain:perplexity.ai"
         ]
       },
@@ -483,7 +629,6 @@ Apply the hardened Xray configuration template directing selected AI platforms t
         "domain": [
           "geosite:openai",
           "geosite:anthropic",
-          "geosite:google-gemini",
           "geosite:perplexity",
           "domain:openai.com",
           "domain:chatgpt.com",
@@ -500,18 +645,6 @@ Apply the hardened Xray configuration template directing selected AI platforms t
           "domain:anthropic.com",
           "domain:claude.ai",
           "domain:claude.com",
-          "domain:gemini.google.com",
-          "domain:aistudio.google.com",
-          "domain:generativelanguage.googleapis.com",
-          "domain:alkalimakersuite-pa.googleapis.com",
-          "domain:proactivebackend-pa.googleapis.com",
-          "domain:deepmind.google",
-          "domain:notebooklm.google",
-          "domain:notebooklm.google.com",
-          "domain:ai.google.dev",
-          "domain:generativeai.google",
-          "domain:vertexai.googleapis.com",
-          "domain:aiplatform.googleapis.com",
           "domain:cursor.sh",
           "domain:cursor.com",
           "domain:cursor-cdn.com",
@@ -534,10 +667,9 @@ Apply the hardened Xray configuration template directing selected AI platforms t
   },
   "dns": {
     "servers": [
-      "https://1.1.1.1/dns-query",
-      "https://8.8.8.8/dns-query",
       "1.1.1.1",
       "8.8.8.8",
+      "1.0.0.1",
       "localhost"
     ],
     "queryStrategy": "UseIPv4"
@@ -579,11 +711,10 @@ Apply the hardened Xray configuration template directing selected AI platforms t
 ### Step 7: Deploy Subscription Gateway (`sub-enhancer`)
 
 > [!CAUTION]
-> **Subscription Security & Threat Model:**  
-> Serving subscription URLs over plain HTTP (`http://`) on public ports (`2096`, `28443`) transmits your VLESS credentials, UUIDs, Reality public keys (`pbk`), and Short IDs in unencrypted base64 across the internet. Censorship DPI and ISPs sniffing these ports can immediately extract and block your proxy credentials!  
-> **Hardened Practice:**  
-> 1. By default, `sub-enhancer.py` binds strictly to `127.0.0.1` and is accessed securely through the encrypted SSH tunnel (`http://localhost:23600/...` or `localhost:2096`).  
-> 2. If remote subscription distribution without SSH is required, `sub-enhancer.py` must use TLS/HTTPS encryption with SSL certificates (`/etc/x-ui/sub_cert.pem`).
+> **Subscription Security & Mobile Client Architecture:**  
+> 1. **Public Gateway Mode (Default in `universal_deploy.sh`):** `sub-enhancer.py` binds to `0.0.0.0` on ports `2096` and `28443` to enable seamless over-the-air subscription updates on mobile devices (Happ on iOS/Android, Shadowrocket, v2rayN). Subscriptions are distributed over plain HTTP using obscure cryptographic tokens (`/sub_sec_un/<token>`) to prevent URL enumeration.  
+> 2. **SSL / TLS Warning for Subscriptions:** Do **NOT** use self-signed TLS certificates for subscription endpoints. Mobile OS trust stores reject self-signed certificates (`SSLHandshakeException` / `x509: certificate signed by unknown authority`), breaking subscription updates. Only enable TLS (`SUB_ENABLE_TLS=true`) if you have bound a valid domain with a genuine CA certificate (e.g. Let's Encrypt).  
+> 3. **Zero-Exposure Mode (SSH-Only):** For paranoid zero-exposure operations, set `SUB_LISTEN=127.0.0.1` and close ports 2096/28443 in the firewall. Clients must then update subscriptions exclusively through local SSH port forwarding (`client-tools/open_panel_localhost`).
 
 * **Executable:** `/usr/local/bin/sub-enhancer.py` (normalizes URL typos, injects `hosts` table labels, and adds `Profile-Update-Interval: 12` headers).
 * **Systemd Unit:** `/etc/systemd/system/sub-enhancer.service`.
@@ -599,17 +730,24 @@ systemctl enable --now sub-enhancer
 ## 📱 5. Client Application Setup & Multi-SNI Profiles
 
 ### 5.1. Importing the Subscription (Happ / Shadowrocket / v2rayN / v2rayNG)
-1. Launch the 3X-UI management console via the SSH tunnel tool (`open_panel_localhost.bat` on Windows or `open_panel_localhost.sh` on macOS/Linux).
-2. Click the **QR Code** icon next to your client record in the inbound list, and copy the subscription URL (e.g. via local tunnel `http://127.0.0.1:23600/...` or secure `https://` endpoint).
-3. Open **Happ** (or Shadowrocket / v2rayN / v2rayNG) on your device and import the subscription.
-4. **Autonomous Synchronizations:** The subscription header enforces automatic synchronization every 12 hours (`Profile-Update-Interval: 12`). To manually pull newly updated nodes or shortIds at any time, tap the 🔄 refresh icon inside your client.
+1. **Locate your Sub-Enhancer Gateway URL:** Do not import raw un-enhanced loopback links (`http://127.0.0.1:23600/...`) directly from the panel. Use the public Sub-Enhancer Gateway distribution endpoint configured during deployment:
+   * **Base64 Standard Format (Recommended for Happ, Shadowrocket, v2rayN):**  
+     `https://<YOUR_DOMAIN_OR_IP>:2096/sub_sec_<prefix>/<token>`
+   * **Sing-box JSON Profile (For Sing-box / Happ Advanced JSON):**  
+     `https://<YOUR_DOMAIN_OR_IP>:2096/json_sec_<prefix>/<token>`
+   *(The credentials summary and deployment script outputs the exact token URL, e.g., `/sub_sec_un/un_vip_2026`).*
+2. Open **Happ** (or Shadowrocket / v2rayN / v2rayNG) on your device and import the subscription URL.
+3. **Autonomous Synchronizations:** The subscription header enforces automatic synchronization every 12 hours (`Profile-Update-Interval: 12`). To manually pull newly updated nodes or shortIds at any time, tap the 🔄 refresh icon inside your client.
+4. **Selecting Resilient Node Profiles:**
+   * **Domestic / Fixed Broadband:** Choose `Germany • Samsung CDN Ultra ⚡ (TCP Reality Vision)` for lowest overhead and maximum throughput.
+   * **Cellular Data & Restrictive Networks (Middlebox IP-ASN Heuristics):** Select **`Antarctica • Direct TLS Fast ⚡`** (port 8443) or **`Antarctica • ICEbreaker (XHTTP) 🧊`** (port 2083). These nodes use your registered server domain (Self-SNI) and discrete HTTP/2 chunking to bypass active middlebox RST injection.
 
 ### 5.2. Client-Side Split Tunneling & Routing Policies
 To maximize throughput and avoid latency on regional banking, government, and media services:
 1. In Happ, set the Rule Order to: **Block → Direct → Proxy**.
 2. **Behavior & Operational Nuances:**
    * **Block:** Ad trackers, telemetry, and malicious domains (`geosite:category-ads-all`) are discarded immediately.
-   * **Direct:** Domestic websites, local banking apps, and low-latency domestic services (`geosite:ru`, `geoip:ru`) bypass the VPN completely, connecting at maximum physical ISP line speeds.
+   * **Direct:** Domestic websites, local banking apps, and low-latency local services (e.g. `geosite:category-domestic`, `geoip:domestic`, or your resident country code) bypass the VPN completely, connecting at maximum physical ISP line speeds.
      * *Nuance Note:* Some international blocked resources may use domestic CDN nodes, while certain regional services may utilize foreign cloud IPs. Keep your client's GeoSite and GeoIP routing databases updated.
    * **Proxy:** International services, AI platforms, streaming networks, and blocked endpoints match **Proxy** and route securely through the hardened remote VPS.
    * **IPv6 Leak Protection:** If your local ISP provides IPv6, ensure your client is set to prefer IPv4 (`UseIPv4` / `IPv4 Preferred`) or disable IPv6 tunneling if the VPS egress uses dedicated IPv4. This eliminates silent DPI leaks and connection resets over unmonitored IPv6 routes.
@@ -721,6 +859,30 @@ To restore a snapshot, copy the backup file back to `/etc/x-ui/x-ui.db` and exec
      ```bash
      ss -tlpn | grep 23600
      ```
+4. **Subscription Download Timeout in Client Apps (e.g., `timeout (7s)`):**
+   * Confirm that the client VPN (TUN mode or system proxy) is temporarily **switched off** before updating subscriptions, preventing recursive proxy deadlocks.
+   * Verify the `sub-enhancer` daemon is active: `systemctl status sub-enhancer`.
+   * Ensure subscription ports (`2096`, `28443`) are reachable and permitted in the firewall: `firewall-cmd --list-ports` or `ufw status`.
+5. **VLESS Reality Handshake Timing Out:**
+   * Confirm that the client's SNI exactly matches one of the domains listed in `realitySettings.serverNames` for Inbound #1. Unlisted SNIs are rejected by Xray as unauthorized probes.
+   * Confirm that the client uses an authorized `shortId` present in `realitySettings.shortIds`.
+   * If regional DPI middleboxes throttle foreign tech SNIs (`www.google.com`), connect using the Self-SNI / Direct TLS profile on port `8443`.
+6. **Handshake Succeeds but Data Stream Freezes After ~16 KB (L7 DPI Behavioral Flow Analysis):**
+   * *Symptom:* Tunnel establishes, initial ping responds, but opening web pages, video streams, or downloading files stalls indefinitely (`HTTP 000` / timeout).
+   * *Diagnosis:* Run `ss -tnp` on the server while the client attempts to stream. If the client socket displays a clogged `Send-Q` buffer (e.g. 1000–2000 un-ACKed bytes) that never clears, the regional middlebox DPI has identified raw TCP proxy flow characteristics and is silently blackholing payload packets without emitting RST.
+   * *Resolution:* Migrate Inbound #1 from `network: tcp` to `network: xhttp` with `security: reality` and `mode: auto` (or deploy an XHTTP TLS inbound). XHTTP encapsulates proxy traffic within standard, discrete HTTP/2 requests with randomized chunking, completely evading stream-level DPI classification.
+7. **Connection Constantly Drops / Resets During Idle Periods or Video Streams (Middlebox State Timeout):**
+   * *Symptom:* Connection frequently resets after pauses in browsing (30–60 seconds of inactivity); client logs report `connection reset by peer` (TCP RST).
+   * *Diagnosis:* Inspect Linux kernel keepalive: `sysctl net.ipv4.tcp_keepalive_time`. If set to default `7200` (2 hours), middlebox stateful firewalls drop connection tracking states after 30–60 seconds of silence, rejecting subsequent packets.
+   * *Resolution:* Apply anti-DPI kernel keepalive parameters (`net.ipv4.tcp_keepalive_time=20`, `net.ipv4.tcp_keepalive_intvl=5`, `net.ipv4.tcp_keepalive_probes=4`) and enable socket keepalive in Xray inbound `streamSettings.sockopt` (`"tcpKeepAliveInterval": 15`).
+8. **Nodes Display "n/a" Latency in Client Applications (Happ, v2rayN):**
+   * *Symptom:* The active connected node displays latency (e.g. 120 ms), but all unselected nodes in the subscription list display `n/a` (Not Available).
+   * *Diagnosis:* Popular clients (such as Happ) utilize ICMP Echo (Ping) to measure latency across subscription nodes. If the server has `net.ipv4.icmp_echo_ignore_all = 1` enabled, ICMP packets are silently dropped.
+   * *Resolution:* Enable ICMP echo replies on the server: `sysctl -w net.ipv4.icmp_echo_ignore_all=0` (and persist in `/etc/sysctl.conf`).
+9. **Periodic Proxy Disconnections Due to Dynamic DNS (DDNS) Instability:**
+   * *Symptom:* Client tunnels drop intermittently; client logs indicate DNS lookup errors or resolution timeouts for public dynamic DNS hostnames.
+   * *Diagnosis:* Restrictive ISPs aggressively throttle, poison, or fail to resolve low-TTL free DDNS subdomains.
+   * *Resolution:* In `sub-enhancer`, configure direct IP addressing (`SUB_CONNECT_IP=<SERVER_IP>`) so client configurations connect directly to the server IP while keeping the genuine domain in the `sni` parameter for TLS validation.
 
 ---
 
@@ -753,8 +915,8 @@ Send ICMP echo requests to the server IP:
 ping -c 4 <YOUR_VPS_IP>
 ```
 * **Expected Result:**
-  * Default mode: `100% packet loss` (Host ignores opportunistic ping sweeps).
-  * Stack Mimicry mode (`--keep-icmp`): Normal ICMP Echo Replies matching standard web/CDN server behavior.
+  * Standard mode (Stack Mimicry): Normal ICMP Echo Replies matching standard web/CDN server behavior and enabling client speedometer tests.
+  * Stealth mode (`--stealth-icmp`): `100% packet loss` (Host ignores opportunistic ping sweeps).
 
 #### 4. Verify Subscription Gateway Sanitization (via SSH Tunnel)
 With the SSH tunnel active (`client-tools/open_panel_localhost.sh` or `.bat`), test an unauthenticated root request against the local forwarded subscription port:
@@ -762,6 +924,76 @@ With the SSH tunnel active (`client-tools/open_panel_localhost.sh` or `.bat`), t
 curl -I http://127.0.0.1:2096/
 ```
 * **Expected Result:** `HTTP/1.0 404 Not Found` (or empty response) with `Cache-Control: no-store` and `X-Content-Type-Options: nosniff` headers, and zero disclosure of internal 3X-UI fingerprints.
+
+---
+
+### 6.7. Operational Best Practices: Critical Dos and Don'ts
+
+Based on rigorous cross-network diagnostics, live packet tracing, and censorship evasion experiments across hostile ISP middleboxes (including national Layer-7 DPI and carrier-grade middlebox filtering), system administrators must adhere to the following mandatory engineering rules:
+
+#### 1. VLESS Reality SNI & SAN Certificate Alignment
+* ❌ **DO NOT mix incompatible domains under a single Reality Inbound:** Never put Apple (`gateway.icloud.com`), Google (`dl.google.com`), and Microsoft (`www.microsoft.com`) together under a single inbound with `dest: dl.google.com:443`.
+* ❌ **DO NOT use an SNI that is not listed in `realitySettings.serverNames`:** If an inbound has `dest: dl.google.com:443` and only `www.google.com` in `serverNames`, any client connecting with `dl.google.com` will be rejected by Xray as an unauthorized probe and dropped into fallback, timing out the connection.
+* ⚠️ **WHY:** In the Reality protocol, the certificate sent to the client during the TLS handshake is obtained from `dest`. If `dest` is Google, Google returns its own certificate (`*.google.com`). If a client requests `gateway.icloud.com` or `www.microsoft.com`, strict clients immediately abort the connection due to TLS certificate hostname mismatch (`SSL_ERROR_BAD_CERT_DOMAIN`). Moreover, active DPI probes that inspect the returned certificate against the requested SNI immediately flag the VPS as a Reality proxy server.
+* ✅ **DO:** Ensure every entry in `realitySettings.serverNames` is a valid Subject Alternative Name (SAN) of the target `dest` certificate. Synchronize the `hosts` table strictly with this validated pool.
+
+#### 2. Short ID Backwards Compatibility & Rotation
+* ❌ **DO NOT purge existing production Short IDs during automated rotation:** Never replace `realitySettings.shortIds` with completely fresh random values without retaining previously provisioned client keys.
+* ⚠️ **WHY:** When a client saves a subscription node or manual configuration, it binds to a specific Short ID (e.g., `<PRIMARY_SHORT_ID>`). If a maintenance script regenerates `shortIds` from scratch without backward compatibility, all existing client apps instantly fail to establish the Reality handshake.
+* ✅ **DO:** Maintain a persistent set of active production Short IDs. When introducing new tokens or retiring compromised sample keys, ensure the primary production Short ID remains active.
+
+#### 3. URL Query Parameter Encoding in Subscription Gateways (`spx`)
+* ❌ **DO NOT unescape percent-encoded slashes (`%2F`) into raw slashes (`/`) in subscription URLs:** Avoid regexes like `re.sub(r"([?&]spx=)%2[fF]", r"\g<1>/", line)`.
+* ⚠️ **WHY:** While RFC 3986 permits raw `/` inside query components under certain conditions, many mobile and desktop client URL parsers (Happ, Sing-box, v2rayN, FoXray, Streisand) split parameters using regexes like `[^/?#]+` or treat raw `/` as a path delimiter. This truncates or corrupts subsequent query parameters, specifically dropping `flow=xtls-rprx-vision`. Without the Vision flow parameter, direct XTLS streaming fails.
+* ✅ **DO:** Keep `spx=%2F...` properly percent-encoded at all times.
+
+#### 4. Server-Side Xray DNS Architecture: Direct UDP vs DoH
+* ❌ **DO NOT configure DNS-over-HTTPS (`https://.../dns-query`) as the primary resolver inside `xrayTemplateConfig`:** Avoid `https://1.1.1.1/dns-query` or `https://8.8.8.8/dns-query` in Xray's internal DNS section.
+* ⚠️ **WHY:** DoH requires establishing an encrypted TLS connection to port 443 of the resolver for each lookup. When combined with client-side FakeDNS (where domains are sniffed from synthetic `198.18.0.x` IPs) and `domainStrategy: "IPIfNonMatch"`, recursive DoH resolution introduces 300–800 ms latency spikes, socket exhaustion, or complete DNS lockups if the upstream host throttles outbound port 443 to foreign DNS providers.
+* ✅ **DO:** Configure fast, direct UDP/TCP DNS resolvers (`1.1.1.1`, `8.8.8.8`, `1.0.0.1`, `localhost`) with `queryStrategy: "UseIPv4"`.
+
+#### 5. Subscription Gateway Network Binding & Firewall Ports
+* ❌ **DO NOT bind `sub-enhancer` exclusively to `127.0.0.1` unless all clients use SSH tunnels:**
+* ❌ **DO NOT omit subscription ports (`2096`, `28443`) from firewall rules:**
+* ❌ **DO NOT force self-signed TLS certificates on subscription endpoints:**
+* ⚠️ **WHY:** If `sub-enhancer.service` specifies `SUB_LISTEN=127.0.0.1` or the firewall blocks port 2096, mobile clients (Happ on iOS/Android, Shadowrocket, v2rayNG) cannot fetch or refresh node lists over cellular data or Wi-Fi, resulting in persistent connection timeouts (`Failed to download subscription: timeout (7s)`). Furthermore, mobile OS trust stores strictly reject self-signed certificates (`SSLHandshakeException` / `x509: certificate signed by unknown authority`), permanently preventing users from fetching subscriptions.
+* ✅ **DO:** Bind `SUB_LISTEN` to `0.0.0.0`, open ports `2096` and `28443` in UFW / firewalld, and secure subscription endpoints using secret tokens (e.g. `/sub_sec_.../<token>`). Serve over plain HTTP on raw IP addresses. If TLS/HTTPS distribution is desired, configure a real public domain with a genuine CA-signed Let's Encrypt certificate and enable `SUB_ENABLE_TLS=true`.
+
+#### 6. Mitigating State-Level Middlebox IP-ASN Discrepancy (Self-SNI / Direct TLS)
+* ❌ **DO NOT rely solely on foreign big-tech SNIs (e.g. `www.google.com`, `www.samsung.com`) in regions with active Layer-7 IP-ASN validation middleboxes:**
+* ⚠️ **WHY:** Modern middleboxes monitor the TLS ClientHello SNI and verify whether the destination IP address belongs to the Autonomous System (ASN) of that domain. When a commercial datacenter VPS IP advertises a major brand SNI (such as Google or Samsung) while hosted on an unrelated hosting provider ASN, the DPI filter detects an "IP-ASN Mismatch" and throttles or injects immediate TCP RST packets after the ClientHello. This heuristic is enforced especially aggressively across major Tier-1 mobile cellular operators.
+* ✅ **DO:** Provide a **Self-SNI / Direct TLS** node (e.g. VLESS over TLS on port 8443 using your actual server domain and a genuine Let's Encrypt certificate). Because the domain genuinely resolves to your VPS IP, there is zero ASN discrepancy, completely neutralizing heuristic DPI blocking across all mobile and fixed carriers.
+
+#### 7. Client-Side Troubleshooting: Circular Proxy Lockouts & Per-App Split Tunneling
+* ❌ **DO NOT refresh a failing subscription in client apps while TUN mode is active on a dead node:**
+* ❌ **DO NOT assume VPN failure when testing non-proxied applications in Per-App Split Tunneling mode:**
+* ⚠️ **WHY:** 
+  1. When a client app (like Happ) has TUN mode enabled with a broken proxy selected, the operating system routes all outbound traffic into the non-functional tunnel. When the client attempts to update its subscription from the VPS gateway, the update request is trapped inside the dead proxy, resulting in a false-negative timeout.
+  2. In client applications like Happ, Sing-box, or NekoBox, Per-App Routing (Split Tunneling) restricts proxy routing strictly to listed binaries (`process_path`). Unlisted software (such as Microsoft Edge, command-prompt `curl` or `ping`, and background system updaters) bypass the VPN tunnel and connect directly (`final: direct`). Testing connection health via terminal or unlisted browsers will observe unproxied ISP traffic, creating false impressions of total node failure. Furthermore, ensure the imported subscription profile is toggled ON (`enabled: true`) in client subscription management.
+* ✅ **DO:** Temporarily toggle the VPN connection switch OFF before adding or refreshing subscriptions in client applications, ensure the VPS subscription profile is toggled ON, and test connectivity using an application explicitly included in the client's proxy rule list (such as Google Chrome, Firefox, or Telegram).
+
+#### 8. TCP KeepAlive Tuning Against Middlebox State Drops
+* ❌ **DO NOT leave Linux kernel TCP keepalive at default 7200s on proxy hosts:**
+* ⚠️ **WHY:** Stateful middlebox firewalls (e.g., national Layer-7 DPI appliances, enterprise perimeter firewalls, and carrier-grade NAT) discard idle connection states after 30–60 seconds of inactivity. When client or server traffic resumes after a pause, the middlebox rejects untracked packets and injects a `TCP RST`, causing constant connection drops. In Linux, sysctl `net.ipv4.tcp_keepalive_*` sets host kernel defaults, but applies only to sockets with `SO_KEEPALIVE`. In Go-based Xray-core, socket keepalive is governed by Go runtime defaults and `streamSettings.sockopt`.
+* ✅ **DO:** Configure aggressive TCP keepalive (`net.ipv4.tcp_keepalive_time = 20`, `net.ipv4.tcp_keepalive_intvl = 5`, `net.ipv4.tcp_keepalive_probes = 4`) AND explicitly set Xray socket options (`streamSettings.sockopt.tcpKeepAliveIdle: 20`, `tcpKeepAliveInterval: 5`) across inbounds and outbounds.
+
+#### 9. Direct IP Addressing & Sing-box JSON Address Normalization
+* ❌ **DO NOT export bare dynamic DNS hostnames as the connection address in client subscription links:**
+* ❌ **DO NOT forward raw upstream 3X-UI Sing-box JSON subscriptions without address rewriting:**
+* ⚠️ **WHY:** 
+  1. Adversarial ISPs aggressively throttle, poison, or fail to resolve free public dynamic DNS subdomains. When a client reconnects or switches networks, DNS lookup failure severs the proxy tunnel.
+  2. When 3X-UI exports profiles in Sing-box JSON format (`/json_sec_...`) through a local reverse proxy (`http://127.0.0.1:2095`), 3X-UI automatically populates the inbound address field with `"address": "localhost"`. If `sub-enhancer` does not inspect and normalize JSON streams, client applications import nodes configured to connect to loopback `127.0.0.1` on the user's local device, resulting in immediate connection rejection (`Connection refused`).
+* ✅ **DO:** Configure `sub-enhancer` to emit the direct server IP address as the connection host (e.g. `vless://uuid@<SERVER_IP>:port`) while preserving the actual domain in the `sni` parameter for TLS certificate verification. For Sing-box JSON subscriptions, `sub-enhancer` must intercept and substitute `"address": "localhost"` with the public IPv4 (`SUB_PUBLIC_IP` / `SUB_CONNECT_IP`).
+
+#### 10. XHTTP Transport Migration for DPI-Heavy Geographies
+* ❌ **DO NOT rely exclusively on raw `VLESS + TCP + Reality` in regions with active Layer-7 behavioral DPI:**
+* ⚠️ **WHY:** Modern DPI middleboxes analyze TCP flow characteristics, packet sizes, and durations, freezing raw TCP proxy streams after ~16 KB of payload data.
+* ✅ **DO:** Deploy **VLESS + XHTTP + Reality** (`network: xhttp`, `security: reality`, `mode: auto`). XHTTP encapsulates proxy data within genuine, discrete HTTP/2 requests with randomized chunking, completely evading stream-level DPI classification.
+
+#### 11. ICMP Echo Configuration vs Client Latency Measurement
+* ❌ **DO NOT leave ICMP echo completely disabled if end-users rely on client-side latency tests (speedometers):**
+* ⚠️ **WHY:** Many client apps (such as Happ) utilize ICMP ping to test server availability across subscription lists. Disabling ICMP echo causes all nodes to display `n/a` (Not Available), creating false impressions of server failure.
+* ✅ **DO:** Balance security and usability: enable ICMP echo (`net.ipv4.icmp_echo_ignore_all = 0`) to support client speed tests, while isolating all administrative and non-public service ports behind firewall and SSH tunnel controls.
 
 ---
 
