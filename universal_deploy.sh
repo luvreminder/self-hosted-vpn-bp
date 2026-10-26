@@ -15,7 +15,7 @@ SINGLE_PORT_443=false
 ENABLE_HYSTERIA=false
 CHECK_ONLY=false
 STEALTH_ICMP=false
-SUB_PORTS="${SUB_PORTS:-2096,28443}"
+SUB_PORTS="${SUB_PORTS:-2096,28443,80}"
 
 show_help() {
     cat << 'EOF'
@@ -32,7 +32,7 @@ Options:
   --enable-hysteria     Enable Hysteria 2 / QUIC UDP 443 and port hopping range (20000-50000/udp).
   --stealth-icmp        Enable silent ICMP blackhole mode (drops ping; hides from mass sweeps). Default is active ICMP (Stack Mimicry).
   --keep-icmp           (Deprecated alias) Keep standard ICMP echo responses active.
-  --sub-ports PORTS     Custom comma-separated subscription gateway ports (default: 2096,28443).
+  --sub-ports PORTS     Custom comma-separated subscription gateway ports (default: 2096,28443,80).
 
 Documentation: README.md
 EOF
@@ -369,6 +369,9 @@ systemctl stop x-ui || true
 
 if [ -f "$DB_PATH" ]; then
     echo "🔒 Hardening 3X-UI panel: Binding strictly to 127.0.0.1:23600 (accessible only via SSH tunnel)..."
+    HOST_IP=$(curl -s4m 3 https://api.ipify.org 2>/dev/null || curl -s4m 3 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
+    [ -z "$HOST_IP" ] && HOST_IP="YOUR_SERVER_IP"
+
     sqlite3 "$DB_PATH" << SQL_EOF
 INSERT INTO settings (key, value) VALUES ('webListen', '127.0.0.1')
 ON CONFLICT(key) DO UPDATE SET value=excluded.value;
@@ -390,8 +393,20 @@ ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 
 INSERT INTO settings (key, value) VALUES ('subPath', '/sub/')
 ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+INSERT INTO settings (key, value) VALUES ('subURI', 'http://${HOST_IP}:2096/sub/')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+INSERT INTO settings (key, value) VALUES ('subJsonPath', '/json_sub/')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+INSERT INTO settings (key, value) VALUES ('subJsonURI', 'http://${HOST_IP}:2096/json_sub/')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+INSERT INTO settings (key, value) VALUES ('subJsonEnable', 'true')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 SQL_EOF
-    echo "✅ 3X-UI panel and subscription server bound strictly to localhost."
+    echo "✅ 3X-UI panel and subscription server configured with public gateway routing."
 
     echo "⚙️ Configuring hardened Xray Core split-routing in 3X-UI database..."
     if [ -f "$TEMPLATE_FILE" ]; then
@@ -535,8 +550,14 @@ class SubHandler(BaseHTTPRequestHandler):
 
         self.send_response(status)
         for k, v in headers.items():
-            if k.lower() not in ("content-length", "transfer-encoding", "connection", "profile-update-interval"):
-                self.send_header(k, v)
+            if k.lower() in ("content-length", "transfer-encoding", "connection", "profile-update-interval"):
+                continue
+            safe_v = str(v).replace("\r", " ").replace("\n", " ").replace("\x85", " ")
+            try:
+                safe_v.encode("latin-1")
+            except UnicodeEncodeError:
+                safe_v = safe_v.encode("utf-8", errors="ignore").decode("latin-1", errors="replace")
+            self.send_header(k, safe_v)
         self.send_header("Profile-Update-Interval", "12")
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, private")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -545,10 +566,32 @@ class SubHandler(BaseHTTPRequestHandler):
         if method == "GET" and body:
             self.wfile.write(body)
 
+class DualProtocolServer(ThreadingHTTPServer):
+    def __init__(self, server_address, RequestHandlerClass, ssl_ctx=None):
+        self.ssl_ctx = ssl_ctx
+        super().__init__(server_address, RequestHandlerClass)
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        if not self.ssl_ctx:
+            sock.settimeout(15.0)
+            return sock, addr
+        try:
+            sock.settimeout(5.0)
+            first_byte = sock.recv(1, socket.MSG_PEEK)
+            sock.settimeout(15.0)
+            if first_byte == b"\x16":
+                sock = self.ssl_ctx.wrap_socket(sock, server_side=True)
+        except Exception as err:
+            sys.stderr.write(f"TLS wrap notice for {addr[0]}: {err} (serving as plain HTTP)\n")
+            try:
+                sock.settimeout(15.0)
+            except OSError:
+                pass
+        return sock, addr
+
 def start_server(listen_ip, port, ssl_ctx=None):
-    server = ThreadingHTTPServer((listen_ip, port), SubHandler)
-    if ssl_ctx:
-        server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+    server = DualProtocolServer((listen_ip, port), SubHandler, ssl_ctx)
     server.serve_forever()
 
 if __name__ == "__main__":
@@ -563,7 +606,7 @@ if __name__ == "__main__":
         except Exception:
             ssl_context = None
 
-    raw_ports = os.environ.get("SUB_PORTS", "2096,28443").split(",")
+    raw_ports = os.environ.get("SUB_PORTS", "2096,28443,80").split(",")
     ports = [int(p.strip()) for p in raw_ports if p.strip()]
     for p in ports[:-1]:
         t = threading.Thread(target=start_server, args=(SUB_LISTEN, p, ssl_context), daemon=True)
@@ -680,8 +723,11 @@ echo "   Next Steps:"
 echo "   1. Connect to panel via SSH tunnel: client-tools/open_panel_localhost.bat / .sh"
 echo "   2. Configure VLESS Reality inbound on port 443 with SNIs matching your dest certificate."
 if [ "$SINGLE_PORT_443" = true ]; then
-    echo "   3. Fetch subscription securely via https://<DOMAIN>/sub_sec_un/<token> on standard port 443."
+    echo "   3. Fetch subscription securely via https://<DOMAIN>/sub_path on standard port 443."
 else
-    echo "   3. Fetch subscription securely via public gateway (http://<VPS_IP>:2096/sub_path) or SSH tunnel."
+    echo "   3. Fetch subscription securely via public gateway:"
+    echo "      • Universal (Port 80 HTTP, Unblocked): http://${HOST_IP}/sub/<token>"
+    echo "      • Direct Gateway (Port 2096 HTTP):     http://${HOST_IP}:2096/sub/<token>"
+    echo "      • TLS Gateway (Port 2096 HTTPS):       https://<YOUR_DOMAIN>:2096/sub/<token>"
 fi
 echo "=========================================================="
