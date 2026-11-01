@@ -128,6 +128,74 @@ if row:
     print(f"     Cryptographic Short IDs ({len(sorted_sids)}): {', '.join(sorted_sids)}")
 
 # -------------------------------------------------------------
+# STEP 2.1: Verify Reality Dest Reachability & Private VLAN Host Routing
+# -------------------------------------------------------------
+print("\n[+] 2.1. Verifying Reality target destination reachability & Private VLAN routing...")
+dest_host = dest_target.split(":")[0]
+dest_port = int(dest_target.split(":")[1]) if ":" in dest_target else 443
+
+def check_dest_reachability(host, port, timeout=3.0):
+    try:
+        import socket, ssl
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ts = ctx.wrap_socket(s, server_hostname=host)
+        ts.close()
+        return True, "TLS Handshake OK"
+    except Exception as err:
+        return False, str(err)
+
+dest_ok, dest_msg = check_dest_reachability(dest_host, dest_port)
+if dest_ok:
+    print(f"[OK] Reality dest ({dest_target}) is healthy and reachable: {dest_msg}")
+else:
+    print(f"[!] Reality dest ({dest_target}) unreachable: {dest_msg}")
+    print("[*] Checking for Private VLAN (PVLAN) intra-subnet isolation...")
+    try:
+        gw_res = subprocess.run("ip route show default 2>/dev/null", shell=True, capture_output=True, text=True)
+        gw_match = re.search(r"default via (\S+) dev (\S+)", gw_res.stdout)
+        if gw_match:
+            default_gw = gw_match.group(1)
+            default_dev = gw_match.group(2)
+            import socket
+            dest_ips = list({res[4][0] for res in socket.getaddrinfo(dest_host, dest_port, socket.AF_INET, socket.SOCK_STREAM)})
+            for d_ip in dest_ips:
+                print(f"[*] Applying host route: {d_ip} via default gateway {default_gw} dev {default_dev}")
+                subprocess.run(["ip", "route", "replace", d_ip, "via", default_gw, "dev", default_dev], check=False)
+                # Persist route via NetworkManager if available
+                nm_check = subprocess.run(["nmcli", "-t", "-f", "NAME,DEVICE", "connection", "show", "--active"], capture_output=True, text=True)
+                for line in nm_check.stdout.splitlines():
+                    if f":{default_dev}" in line or f":{default_dev}:" in line or line.endswith(f":{default_dev}"):
+                        conn_name = line.split(":")[0]
+                        subprocess.run(["nmcli", "connection", "modify", conn_name, "+ipv4.routes", f"{d_ip}/32 {default_gw}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Also write fallback route file for RHEL/CentOS/Rocky
+                route_file = f"/etc/sysconfig/network-scripts/route-{default_dev}"
+                if os.path.exists(f"/etc/sysconfig/network-scripts/ifcfg-{default_dev}"):
+                    try:
+                        with open(route_file, "a+") as rf:
+                            rf.seek(0)
+                            existing_routes = rf.read()
+                            if d_ip not in existing_routes:
+                                rf.write(f"{d_ip}/32 via {default_gw} dev {default_dev}\n")
+                    except Exception:
+                        pass
+            
+            # Re-test reachability
+            re_ok, re_msg = check_dest_reachability(dest_host, dest_port)
+            if re_ok:
+                print(f"[OK] Reality dest connectivity restored via gateway routing: {re_msg}")
+            else:
+                print(f"[WARN] Reality dest ({dest_target}) remains unreachable ({re_msg}). Verify target server is online.")
+        else:
+            print("[!] Default gateway could not be detected.")
+    except Exception as ex:
+        print(f"[!] PVLAN routing auto-fix exception: {ex}")
+
+# -------------------------------------------------------------
 # STEP 3: Synchronize Node Descriptions in Subscriptions (hosts table)
 # -------------------------------------------------------------
 print("\n[+] 3. Updating subscription camouflage catalog (Sub-Enhancer)...")
@@ -399,6 +467,37 @@ maint_script_content = r'''#!/usr/bin/env bash
 # Monthly VPS Maintenance Script
 set -e
 echo "=== [$(date)] Starting Scheduled Monthly Maintenance ==="
+
+# 0. Ensure Reality dest and PVLAN neighbor routing health
+echo "[*] Checking Reality dest connectivity and intra-subnet routing..."
+DEFAULT_GW=$(ip route show default 2>/dev/null | awk '{print $3}' | head -n1)
+DEFAULT_DEV=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1)
+
+if [ -f /etc/x-ui/x-ui.db ] && [ -n "$DEFAULT_GW" ] && [ -n "$DEFAULT_DEV" ]; then
+    REALITY_DEST=$(sqlite3 /etc/x-ui/x-ui.db "SELECT stream_settings FROM inbounds WHERE id=1;" 2>/dev/null | grep -o '"dest": *"[^"]*"' | head -n1 | cut -d'"' -f4)
+    if [ -n "$REALITY_DEST" ]; then
+        DEST_HOST=$(echo "$REALITY_DEST" | cut -d':' -f1)
+        DEST_PORT=$(echo "$REALITY_DEST" | cut -d':' -f2)
+        [ -z "$DEST_PORT" ] && DEST_PORT=443
+        
+        # Test connection to Reality dest
+        if ! curl -s -I --max-time 3 "https://${DEST_HOST}:${DEST_PORT}" >/dev/null 2>&1; then
+            echo "[!] Reality dest (${REALITY_DEST}) not directly reachable. Resolving IP for gateway route..."
+            DEST_IPS=$(getent ahosts "$DEST_HOST" 2>/dev/null | awk '{print $1}' | sort -u)
+            for d_ip in $DEST_IPS; do
+                echo "[*] Applying gateway host route for Reality dest: $d_ip via $DEFAULT_GW dev $DEFAULT_DEV"
+                ip route replace "$d_ip" via "$DEFAULT_GW" dev "$DEFAULT_DEV" 2>/dev/null || true
+            done
+            if curl -s -I --max-time 3 "https://${DEST_HOST}:${DEST_PORT}" >/dev/null 2>&1; then
+                echo "[OK] Reality dest connection restored via gateway route."
+            else
+                echo "[WARN] Reality dest (${REALITY_DEST}) still unreachable. Please verify donor status."
+            fi
+        else
+            echo "[OK] Reality dest (${REALITY_DEST}) is healthy."
+        fi
+    fi
+fi
 
 # 1. Update GeoIP & GeoSite databases
 echo "[*] Updating GeoIP & GeoSite databases..."

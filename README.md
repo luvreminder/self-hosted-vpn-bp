@@ -983,6 +983,8 @@ Based on rigorous cross-network diagnostics, live packet tracing, and censorship
   2. **The Cloudflare Anycast Trap:** Borrowing domains behind Cloudflare (or other Anycast CDNs) does NOT bypass ASN inspection. Although Cloudflare has millions of Anycast IPs worldwide, all of them are announced strictly under Cloudflare's own ASNs (predominantly **AS13335**). If your VPS is hosted on another provider ASN, `VPS IP ≠ AS13335` immediately triggers the mismatch drop. Additionally, active censor probes forwarded to Cloudflare edge nodes return `cf-ray` error headers and TLS mismatches that instantly identify a proxy server.
 * ✅ **DO (SOTA 2026 Solutions):**
   1. **In-Network ASN Scavenging («Сосед по ASN / подсети» — Recommended for Zero-Domain Reality):** Scan your VPS provider's local subnet (e.g. your `/24` block) using tools like `RealiTLScanner` or TLS probes to find a legitimate neighbor website hosted in the **exact same Autonomous System (ASN)** that supports **TLS 1.3** and **ALPN h2**. Set that neighbor domain in `serverNames` and `dest`. When DPI checks `IP ∈ ASN(SNI)`, the check passes with 100% success because both your VPS and the donor reside in the identical network, with <0.5 ms handshake latency!
+     * ⚠️ **The Cloud Private VLAN (PVLAN) ARP Trap:** When choosing a neighbor donor from your own `/24` block, be aware that many cloud virtualization platforms (e.g. Proxmox, KVM, OpenStack) enforce Private VLAN / switch port isolation to prevent ARP spoofing and cross-tenant sniffing. Under default Linux routing (`<subnet>/24 dev eth0 scope link`), the kernel broadcasts ARP directly on the local Ethernet segment. If the hypervisor switch blocks intra-subnet ARP, or when ARP caches expire after monthly system maintenance, the neighbor becomes unreachable (`No route to host` / `Destination Host Unreachable`), instantly breaking Reality handshakes.  
+       **Fix:** Route traffic to the neighbor IP explicitly via the datacenter default gateway (`ip route add <donor_ip>/32 via <default_gw> dev eth0`) and persist it in NetworkManager. The automated maintenance suite handles this dynamically.
   2. **Self-SNI / Direct TLS (Zero-Discrepancy Backup):** Provide a Direct TLS node on port 8443 using your actual server domain and a genuine Let's Encrypt certificate. Because the domain genuinely resolves to your VPS IP, there is zero ASN discrepancy across all fixed and cellular carriers.
 
 #### 7. Client-Side Troubleshooting: Circular Proxy Lockouts & Per-App Split Tunneling
@@ -1030,11 +1032,12 @@ A recurring systemd maintenance timer is configured to run automatically:
 * **Maintenance Executable:** `/usr/local/bin/vps-monthly-maintenance.sh`
 * **Systemd Timer:** `vps-maintenance.timer` (scheduled for the **1st of every month at 04:30 AM**).
 * **Automated Actions:**
-  1. Fetches freshest anti-censorship routing databases (`x-ui update-all-geofiles`).
-  2. Flushes SQLite write-ahead log and defragments the database (`PRAGMA wal_checkpoint(TRUNCATE); VACUUM;`).
-  3. Vacuums systemd journal logs older than 14 days or exceeding 100MB.
-  4. Verifies Cloudflare WARP health and re-registers the daemon if dropped.
-  5. Gracefully restarts `x-ui` and `sub-enhancer` to apply updated geo-rules.
+  1. Verifies Reality target destination (`dest`) health and automatically injects gateway host routes if Private VLAN (PVLAN) intra-subnet ARP isolation is detected.
+  2. Fetches freshest anti-censorship routing databases (`x-ui update-all-geofiles`).
+  3. Flushes SQLite write-ahead log and defragments the database (`PRAGMA wal_checkpoint(TRUNCATE); VACUUM;`).
+  4. Vacuums systemd journal logs older than 14 days or exceeding 100MB.
+  5. Verifies Cloudflare WARP health and re-registers the daemon if dropped.
+  6. Gracefully restarts `x-ui` and `sub-enhancer` to apply updated geo-rules.
 
 ```bash
 # Check scheduled timer status
@@ -1049,32 +1052,40 @@ journalctl -u vps-maintenance.service -n 30 --no-pager
 ### 📋 7.2. Step-by-Step Manual Maintenance Checklist
 For on-demand audits or manual refreshes:
 
-1. **OS Security Packages:**
+1. **Reality Dest & Intra-Subnet PVLAN Route Audit:**
+   Verify the target `dest` domain can be reached via TLS from the VPS:
+   ```bash
+   # Check if Reality dest responds with TLS 1.3
+   curl -s -I --max-time 4 https://<YOUR_REALITY_DEST>
+   # If 'No route to host' appears for neighbor subnet donors, add host route via default gateway:
+   ip route replace <DONOR_IP> via $(ip route show default | awk '{print $3}') dev eth0
+   ```
+2. **OS Security Packages:**
    ```bash
    dnf upgrade -y --security  # On Enterprise Linux (Rocky / AlmaLinux)
    # apt update && apt upgrade -y  # On Ubuntu / Debian
    ```
-2. **Sync Anti-Censorship Geo-Databases:**
+3. **Sync Anti-Censorship Geo-Databases:**
    ```bash
    x-ui update-all-geofiles
    ```
-3. **Rotate Reality Short IDs:**
+4. **Rotate Reality Short IDs:**
    Generate a new 8-byte hex key (`openssl rand -hex 8`) and append it to the `shortIds` array under Inbound #1 in 3X-UI without deleting existing keys.
-4. **Optimize SQLite Database:**
+5. **Optimize SQLite Database:**
    ```bash
    systemctl stop x-ui
    sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA integrity_check;"
    systemctl start x-ui
    ```
-5. **Verify Cloudflare WARP Egress:**
+6. **Verify Cloudflare WARP Egress:**
    ```bash
    curl -s -x socks5h://127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | grep -E "warp=|loc="
    ```
-6. **Prune Stale Logs:**
+7. **Prune Stale Logs:**
    ```bash
    journalctl --vacuum-time=14d --vacuum-size=100M
    ```
-7. **Audit Fail2ban Jail:**
+8. **Audit Fail2ban Jail:**
    ```bash
    fail2ban-client status sshd
    ```
