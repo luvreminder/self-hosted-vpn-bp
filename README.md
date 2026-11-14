@@ -39,10 +39,13 @@ This specification represents a complete, hardened **Golden Standard reference a
 This repository distribution bundle includes:
 * **`README.md`**: Complete architectural reference, deployment blueprint, and operational runbook.
 * **`universal_deploy.sh`**: Single-command, idempotent bash installer supporting automated deployment.
-* **`sub-enhancer.py`**: Standalone Python HTTP subscription gateway and URL transformer.
+* **`sub-enhancer.py`**: Standalone Python HTTP/HTTPS dual-protocol subscription gateway and SOTA XHTTP/Direct-IP/Sing-box URL transformer.
+* **`generate_warp_wireguard.py`**: Zero-dependency Curve25519 Cloudflare WARP Native WireGuard outbound generator.
+* **`run_monthly_maintenance.py`**: Automated SSH monthly maintenance and anti-censorship synchronization runner.
 * **`xray_template_config.json`**: Hardened Xray core routing configuration with AI split-routing.
 * **`credentials.example.txt`**: Sanitized credentials template for local administration.
 * **`client-tools/`**: Cross-platform client connection and administration scripts (`open_panel_localhost.bat`, `open_panel_localhost.sh`, `change_password.bat`, `change_password.sh`).
+* **`tests/test_sota_architecture.py`**: Automated unit & integration test suite validating cryptographic, DPI-evasion, concurrency, and deployment invariants.
 * **`.gitignore` & `.gitattributes`**: Git repository sanitation rules and cross-platform line ending normalization.
 * **`LICENSE`**: Open-source MIT License.
 
@@ -103,11 +106,16 @@ sudo ./universal_deploy.sh
 
 # Optional Flags:
 # sudo ./universal_deploy.sh --check            # Dry-run environment compatibility check
+# sudo ./universal_deploy.sh --native-warp      # Native WireGuard outbound in Xray (default, 0 MB daemon RAM)
+# sudo ./universal_deploy.sh --legacy-warp      # Legacy Cloudflare WARP daemon in SOCKS5 mode (port 40000)
+# sudo ./universal_deploy.sh --single-port-443  # Next-Gen Single Port 443 architecture (Nginx SNI preread demux)
+# sudo ./universal_deploy.sh --enable-hysteria  # Enable Hysteria 2 / QUIC UDP 443 & port hopping (20000-50000/udp)
+# sudo ./universal_deploy.sh --stealth-icmp     # Enable silent ICMP blackhole mode (default is active ICMP Stack Mimicry)
 # sudo ./universal_deploy.sh --skip-swap        # Skip swapfile allocation
 # sudo ./universal_deploy.sh --skip-warp        # Skip Cloudflare WARP client setup
-# sudo ./universal_deploy.sh --sub-ports 28443  # Custom subscription gateway ports
+# sudo ./universal_deploy.sh --sub-ports 28443  # Custom subscription gateway ports (default: 2096,28443,80)
 ```
-*The installer automatically validates hypervisor capabilities, configures a 2 GB swap if RAM ≤ 1.5 GB, activates TCP BBR with ICMP ping blackholing, sets up Layer-7 BitTorrent packet filtering with reboot persistence, registers Cloudflare WARP SOCKS5 on port 40000, deploys 3X-UI, injects hardened Xray split-routing into SQLite, and starts the dual-port Sub-Enhancer background service.*
+*The installer automatically validates hypervisor capabilities, configures a 2 GB swap if RAM ≤ 1.5 GB, applies `/etc/sysctl.d/99-sota-vpn.conf` (TCP BBR, MTU probing, TFO, KeepAlive, and Stack Mimicry ICMP by default), sets up IPv4/IPv6 Layer-7 BitTorrent packet filtering with reboot persistence, provisions Cloudflare WARP Native WireGuard (or SOCKS5 fallback), deploys 3X-UI on localhost, injects hardened Xray split-routing into SQLite, starts the Sub-Enhancer gateway, and installs the `vps-maintenance.timer` systemd unit.*
 
 ---
 
@@ -186,7 +194,7 @@ This deployment model addresses common operational challenges:
 Deploying infrastructure in environments subject to active network surveillance (such as state-level deep packet inspection (DPI), active probing systems, and automated internet-wide scanner bots like Censys, Shodan, and Shadowserver) introduces unique threat vectors. This architecture employs multi-layered defenses to achieve operational invisibility:
 
 #### 1. Defense Against Internet-Wide Bot Scanners (Shodan, Censys, Masscan)
-* **ICMP Echo Suppression (`net.ipv4.icmp_echo_ignore_all = 1`):** Large-scale reconnaissance crawlers routinely perform ping sweeps across IPv4 ranges before initiating port scans. Discarding all ICMP echo requests renders the host completely silent to automated availability probes.
+* **Controlled ICMP Stack Mimicry (`net.ipv4.icmp_echo_ignore_all = 0` default, `--stealth-icmp` optional):** Modern global crawlers (Censys, Shodan, ZMap) probe `443/tcp` directly with TCP SYN packets regardless of ping responses, whereas suppressing ICMP altogether creates a detectable TCP/IP stack anomaly and breaks client app latency meters (see Sections 3.3.4 and 3.3.9). By default the host maintains standard edge ICMP mimicry while optionally supporting `--stealth-icmp` (`= 1`) when silent ping blackholing is explicitly required.
 * **Complete Administrative Interface Concealment:** The 3X-UI control panel is strictly bound to `127.0.0.1:23600` behind an obscure URI token path. External scans directed at port 23600 or the historical default port `2053` encounter a closed socket (`Connection Refused`), eliminating automated banner grabbing (`Server: x-ui`) and brute-force credential attacks.
 * **Subscription Endpoint Hygiene:** The public HTTP subscription gateway (`sub-enhancer` on port `2096`) only responds to authenticated cryptographic URI paths (e.g. `/sub_sec_un/<token>`). Scanner probes attempting generic requests (such as `GET /` or `GET /sub`) receive an uninformative `404 Not Found` response with no identifying headers or server fingerprints.
 
@@ -298,7 +306,7 @@ In adversarial censorship environments and restrictive national firewall perimet
     "hMaxReusableSecs": 2400
   }
   ```
-  Xray smoothly recycles TCP/TLS connections every 600–800 requests or 30–40 minutes in the background without dropping user sessions, perfectly mimicking organic browser traffic.
+  Xray smoothly recycles TCP/TLS connections every 600–800 requests or 30–40 minutes in the background without dropping user sessions, perfectly mimicking organic browser traffic. When emitting `vless://` share URIs for `type=xhttp`, `sub-enhancer.py` packs `xPaddingBytes` and `xmux` into a URL-encoded JSON `&extra=...` query parameter conforming to the official Xray-core share link specification (rather than non-standard flat `xmux=` keys).
 * **Asymmetric Up/Down Routing (Bypassing 16KB Host Subnet Filters):**
   When DPI applies aggressive RST filtering to outbound connections targeting foreign VPS subnets (the "16KB host filter"), XHTTP allows separating flows:
   - **Uplink:** Client requests route via Cloudflare / CDN using `packet-up` over HTTP/3 QUIC.
@@ -369,36 +377,22 @@ fi
 ---
 
 ### Step 1: Kernel Performance & Anti-DPI Tuning
-1. **Enable TCP BBR & Fair Queueing:**
+1. **Configure `/etc/sysctl.d/99-sota-vpn.conf` (TCP BBR, MTU Probing, TFO, KeepAlive & ICMP):**
+   Writes an isolated sysctl drop-in file (preventing path-MTU blackholes, enabling TCP Fast Open, and preventing middlebox connection-tracking table expiration):
    ```bash
-   sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-   sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-   echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-   echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+   cat << 'EOF' > /etc/sysctl.d/99-sota-vpn.conf
+   net.core.default_qdisc=fq
+   net.ipv4.tcp_congestion_control=bbr
+   net.ipv4.tcp_keepalive_time=20
+   net.ipv4.tcp_keepalive_intvl=5
+   net.ipv4.tcp_keepalive_probes=4
+   net.ipv4.tcp_mtu_probing=1
+   net.ipv4.tcp_fastopen=3
+   # Stack Mimicry default (0); set to 1 for Silent Blackhole Mode (--stealth-icmp)
+   net.ipv4.icmp_echo_ignore_all=0
+   EOF
+   sysctl --system
    ```
-2. **Apply Anti-DPI TCP KeepAlive Tuning:**
-   Prevents middlebox connection-tracking table expiration and eliminates random TCP RST resets during idle periods:
-   ```bash
-   sed -i '/net.ipv4.tcp_keepalive_time/d' /etc/sysctl.conf
-   sed -i '/net.ipv4.tcp_keepalive_intvl/d' /etc/sysctl.conf
-   sed -i '/net.ipv4.tcp_keepalive_probes/d' /etc/sysctl.conf
-   echo "net.ipv4.tcp_keepalive_time=20" >> /etc/sysctl.conf
-   echo "net.ipv4.tcp_keepalive_intvl=5" >> /etc/sysctl.conf
-   echo "net.ipv4.tcp_keepalive_probes=4" >> /etc/sysctl.conf
-   ```
-3. **Configure ICMP Ping Handling:**
-   * *Stack Mimicry & Client Latency Mode (Default — Recommended for client app speedometers and middlebox camouflage):*
-     ```bash
-     sed -i '/net.ipv4.icmp_echo_ignore_all/d' /etc/sysctl.conf
-     echo "net.ipv4.icmp_echo_ignore_all=0" >> /etc/sysctl.conf
-     sysctl -p
-     ```
-   * *Silent Blackhole Mode (Optional for mass-scanner evasion):*
-     ```bash
-     sed -i '/net.ipv4.icmp_echo_ignore_all/d' /etc/sysctl.conf
-     echo "net.ipv4.icmp_echo_ignore_all=1" >> /etc/sysctl.conf
-     sysctl -p
-     ```
 
 ---
 
@@ -502,7 +496,7 @@ systemctl start x-ui
 ---
 
 ### Step 5: Configure Xray Core Routing (`xrayTemplateConfig`)
-Apply the hardened Xray configuration template directing selected AI platforms to the `warp-socks` outbound.
+Apply the hardened Xray configuration template directing selected AI platforms to the `warp-wireguard` outbound (automatically promoted into `/etc/x-ui/xray_template_applied.json` by `universal_deploy.sh` without mutating the repository's `xray_template_config.json`), or to the `warp-socks` fallback when running `--legacy-warp`.
 
 > [!CAUTION]
 > **API and Stats Sections Required:**  

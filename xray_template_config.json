@@ -44,7 +44,8 @@
       "streamSettings": {
         "sockopt": {
           "tcpKeepAliveIdle": 20,
-          "tcpKeepAliveInterval": 5
+          "tcpKeepAliveInterval": 5,
+          "tcpNoDelay": true
         }
       }
     },
@@ -131,9 +132,30 @@
           "geosite:perplexity",
           "domain:openai.com",
           "domain:chatgpt.com",
+          "domain:oaistatic.com",
+          "domain:oaiusercontent.com",
+          "domain:sora.com",
+          "domain:ai.com",
+          "domain:chat.openai.com",
+          "domain:auth0.openai.com",
+          "domain:client-api.arkoselabs.com",
+          "domain:featuregates.org",
+          "domain:statsig.com",
+          "domain:statsigapi.net",
           "domain:anthropic.com",
           "domain:claude.ai",
-          "domain:perplexity.ai"
+          "domain:claude.com",
+          "domain:cursor.sh",
+          "domain:cursor.com",
+          "domain:cursor-cdn.com",
+          "domain:copilot.microsoft.com",
+          "domain:perplexity.ai",
+          "domain:midjourney.com",
+          "domain:x.ai",
+          "domain:grok.com",
+          "domain:deepseek.com",
+          "domain:mistral.ai",
+          "domain:cohere.com"
         ]
       },
       {

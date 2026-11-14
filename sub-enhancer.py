@@ -4,19 +4,24 @@ Subscription Gateway & Node Transformer (Sub-Enhancer)
 Hardened reverse proxy for 3X-UI subscription endpoints:
 - Injects descriptive node titles from the hosts table (Cellular / Wi-Fi / CDN).
 - Normalizes URL typos, trailing slashes, and redundant delimiters.
-- Adds client refresh intervals (Profile-Update-Interval: 12).
-- Normalizes spiderX percent-encoding for client compatibility.
-- Normalizes Reality Vision TCP parameters (removes ML-KEM fragmentation).
-- Adds high-availability Direct TLS and XHTTP nodes.
+- Adds client refresh intervals (Profile-Update-Interval: 12) and strict security headers.
+- Normalizes spiderX percent-encoding and Reality Vision TCP parameters.
+- Configures SOTA XHTTP URL-encoded JSON `extra` (xPaddingBytes + xmux) parameters.
+- Normalizes both Xray [...] and Sing-box {...} JSON subscriptions & Direct-IP endpoints.
+- Supports non-blocking worker-thread Dual HTTP/HTTPS (MSG_PEEK 0x16) on shared ports.
 """
 
 import sys
 import os
 import re
 import ssl
+import json
 import socket
 import sqlite3
 import base64
+import ipaddress
+import threading
+import urllib.error
 import urllib.request
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -28,6 +33,31 @@ SSL_CERT = os.environ.get("SUB_SSL_CERT", "/etc/x-ui/sub_cert.pem")
 SSL_KEY = os.environ.get("SUB_SSL_KEY", "/etc/x-ui/sub_key.pem")
 SUB_PUBLIC_IP = os.environ.get("SUB_PUBLIC_IP", "").strip()
 
+DEFAULT_XHTTP_EXTRA_OBJ = {
+    "xPaddingBytes": "100-1000",
+    "xmux": {
+        "maxConcurrency": "16-32",
+        "cMaxReuseTimes": "64-128",
+        "hMaxRequestTimes": "600-800",
+        "hMaxReusableSecs": "1800-2400",
+        "hKeepAlivePeriod": 30,
+    },
+}
+DEFAULT_XHTTP_EXTRA = urllib.parse.quote(
+    json.dumps(DEFAULT_XHTTP_EXTRA_OBJ, separators=(",", ":")), safe=""
+)
+
+STRIPPED_RESPONSE_HEADERS = frozenset({
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "profile-update-interval",
+    "server",
+    "x-powered-by",
+    "cache-control",
+    "x-content-type-options",
+})
+
 
 def get_host_mappings():
     """Retrieve mapping dictionaries from 3X-UI SQLite database."""
@@ -37,7 +67,8 @@ def get_host_mappings():
         conn = sqlite3.connect(DB_PATH, timeout=2.0)
         cur = conn.cursor()
         rows = cur.execute(
-            "SELECT remark, server_description, sni FROM hosts WHERE is_disabled=0 AND remark IS NOT NULL AND remark != ''"
+            "SELECT remark, server_description, sni FROM hosts "
+            "WHERE is_disabled=0 AND remark IS NOT NULL AND remark != ''"
         ).fetchall()
         conn.close()
         desc_map = {}
@@ -93,25 +124,120 @@ def resolve_node_title(fragment, sni, desc_map, sni_map):
     return f"Node ({sni})" if sni else "Gateway Node"
 
 
+def format_uri_host(host):
+    """Format host for URI authority (bracketing bare IPv6 literals)."""
+    bare = host.strip().strip("[]")
+    if ":" in bare:
+        return f"[{bare}]"
+    return bare
+
+
+def _is_ip_or_local(host):
+    """Return True if host is localhost or a literal IPv4/IPv6 address."""
+    bare = host.strip().strip("[]")
+    if bare.lower() in ("localhost", ""):
+        return True
+    try:
+        ipaddress.ip_address(bare)
+        return True
+    except ValueError:
+        return False
+
+
+def _clean_query_delimiters(url):
+    """Ensure clean single '?' before query parameters and no duplicate '&'."""
+    if "?" in url:
+        base, query = url.split("?", 1)
+        query = query.replace("?", "&")
+    elif "&" in url:
+        base, query = url.split("&", 1)
+    else:
+        return url
+    parts = [p for p in query.split("&") if p]
+    return f"{base}?{'&'.join(parts)}" if parts else base
+
+
+def rewrite_vless_endpoint(main_part, public_host, connect_ip=""):
+    """Rewrite localhost endpoints and apply SOTA Direct-IP SNI preservation."""
+    if public_host:
+        uri_pub = format_uri_host(public_host)
+        main_part = re.sub(
+            r"@(?:localhost|127\.0\.0\.1|\[::1\]):",
+            f"@{uri_pub}:",
+            main_part,
+        )
+
+    if not connect_ip:
+        return main_part
+
+    match = re.search(r"@(\[[0-9a-fA-F:]+\]|[^/?#:]+):(\d+)", main_part)
+    if not match:
+        return main_part
+
+    orig_host, port = match.group(1), match.group(2)
+    uri_ip = format_uri_host(connect_ip)
+    main_part = main_part[:match.start()] + f"@{uri_ip}:{port}" + main_part[match.end():]
+
+    if not _is_ip_or_local(orig_host):
+        encoded_orig = urllib.parse.quote(orig_host, safe="")
+        if "sni=" not in main_part:
+            main_part += f"&sni={encoded_orig}"
+        is_http_transport = any(t in main_part for t in ("type=xhttp", "type=ws", "type=httpupgrade"))
+        if is_http_transport and "host=" not in main_part:
+            main_part += f"&host={encoded_orig}"
+
+    return _clean_query_delimiters(main_part)
+
+
+def _is_xhttp_node(main_part):
+    """Return True if VLESS URI uses XHTTP transport."""
+    return "type=xhttp" in main_part or "net=xhttp" in main_part
+
+
+def _merge_xhttp_extra(main_part):
+    """Ensure XHTTP extra JSON contains xPaddingBytes and xmux ranges (merging 3X-UI mode stubs)."""
+    match = re.search(r"([?&])extra=([^&]*)", main_part)
+    if not match:
+        return main_part + f"&extra={DEFAULT_XHTTP_EXTRA}"
+
+    raw_val = urllib.parse.unquote(match.group(2))
+    try:
+        parsed = json.loads(raw_val) if raw_val else {}
+    except ValueError:
+        return main_part
+
+    if not isinstance(parsed, dict):
+        return main_part
+
+    merged = dict(parsed)
+    changed = False
+    for key in ("xPaddingBytes", "xmux"):
+        if key not in merged:
+            merged[key] = DEFAULT_XHTTP_EXTRA_OBJ[key]
+            changed = True
+
+    if not changed:
+        return main_part
+
+    encoded = urllib.parse.quote(json.dumps(merged, separators=(",", ":")), safe="")
+    return f"{main_part[:match.start()]}{match.group(1)}extra={encoded}{main_part[match.end():]}"
+
+
 def normalize_reality_node(main_part):
-    """Apply strict hardening for Reality nodes (supporting both XHTTP SOTA and legacy TCP Vision)."""
-    main_part = re.sub(r"[?&]support-x25519mlkem768=[^&]+", "", main_part)
+    """Apply strict hardening for Reality nodes (XHTTP SOTA and legacy TCP Vision)."""
+    main_part = re.sub(r"[?&]support-x25519mlkem768=[^&]*", "", main_part)
     main_part = re.sub(r"[?&]spx=[^&]*", "&spx=%2F", main_part)
 
-    # Check if this is an XHTTP Reality node
-    if "type=xhttp" in main_part or "net=xhttp" in main_part:
-        # XHTTP Reality: no flow, requires mode=auto and path
-        main_part = re.sub(r"[?&]flow=[^&]+", "", main_part)
+    if _is_xhttp_node(main_part):
+        main_part = re.sub(r"[?&](?:flow|xmux|maxConcurrency)=[^&]*", "", main_part)
         if "mode=" not in main_part:
             main_part += "&mode=auto"
         if "path=" not in main_part:
             main_part += "&path=%2Fapi%2Fv2%2Fsync"
-        if "xmux=" not in main_part:
-            main_part += "&xmux=1&maxConcurrency=16"
+        main_part = _merge_xhttp_extra(main_part)
     else:
-        # Classic TCP Reality: requires flow=xtls-rprx-vision
         main_part = re.sub(r"[?&]type=[^&]+", "&type=tcp", main_part)
-        main_part = re.sub(r"[?&](?:xmux|maxConcurrency|mode)=[^&]+", "", main_part)
+        main_part = re.sub(r"[?&](?:xmux|maxConcurrency|mode|extra)=[^&]*", "", main_part)
         if "flow=" in main_part:
             main_part = re.sub(r"flow=[^&]+", "flow=xtls-rprx-vision", main_part)
         else:
@@ -120,49 +246,55 @@ def normalize_reality_node(main_part):
     if "fp=" not in main_part:
         main_part += "&fp=chrome"
 
-    return main_part
+    return _clean_query_delimiters(main_part)
 
 
 def normalize_tls_node(main_part):
     """Normalize Direct TLS / XHTTP nodes."""
-    if "type=xhttp" in main_part or "net=xhttp" in main_part:
+    if _is_xhttp_node(main_part):
+        main_part = re.sub(r"[?&](?:flow|xmux|maxConcurrency)=[^&]*", "", main_part)
         if "mode=" not in main_part:
             main_part += "&mode=auto"
-        if "xmux=" not in main_part:
-            main_part += "&xmux=1&maxConcurrency=16"
+        main_part = _merge_xhttp_extra(main_part)
 
     if "fp=" not in main_part:
         main_part += "&fp=chrome"
 
-    return main_part
+    return _clean_query_delimiters(main_part)
 
 
-def process_vless_line(line, sub_host, desc_map, sni_map):
+def _resolve_connect_ip(connect_ip):
+    """Resolve optional SUB_CONNECT_IP override when not explicitly passed."""
+    if connect_ip is None:
+        return os.environ.get("SUB_CONNECT_IP", "").strip()
+    return connect_ip.strip()
+
+
+def process_vless_line(line, sub_host, desc_map, sni_map, connect_ip=None):
     """Process and normalize a single VLESS line."""
     if not line.startswith("vless://"):
         return line
 
-    if sub_host:
-        line = re.sub(r"@(localhost|127\.0\.0\.1):", f"@{sub_host}:", line)
-
+    effective_connect = _resolve_connect_ip(connect_ip)
     main_part, _, fragment = line.partition("#")
-    parsed = urllib.parse.urlsplit(main_part)
-    query = urllib.parse.parse_qs(parsed.query)
-    sni = query.get("sni", [""])[0].strip()
+    main_part = rewrite_vless_endpoint(main_part, sub_host, effective_connect)
 
     if "security=reality" in main_part:
         main_part = normalize_reality_node(main_part)
     elif "security=tls" in main_part:
         main_part = normalize_tls_node(main_part)
+    else:
+        main_part = _clean_query_delimiters(main_part)
 
-    if "?" not in main_part and "&" in main_part:
-        main_part = main_part.replace("&", "?", 1)
+    parsed = urllib.parse.urlsplit(main_part)
+    query = urllib.parse.parse_qs(parsed.query)
+    sni = query.get("sni", [""])[0].strip()
 
     title = resolve_node_title(fragment, sni, desc_map, sni_map)
     return f"{main_part}#{urllib.parse.quote(title)}"
 
 
-def transform_base64_payload(body, sub_host, desc_map, sni_map):
+def transform_base64_payload(body, sub_host, desc_map, sni_map, connect_ip=None):
     """Decode, process and re-encode base64 subscription payload."""
     padded = body.strip()
     padding_needed = (-len(padded)) % 4
@@ -184,7 +316,7 @@ def transform_base64_payload(body, sub_host, desc_map, sni_map):
         line = line.strip()
         if not line:
             continue
-        cleaned = process_vless_line(line, sub_host, desc_map, sni_map)
+        cleaned = process_vless_line(line, sub_host, desc_map, sni_map, connect_ip=connect_ip)
         main_url = cleaned.partition("#")[0]
         if main_url not in seen:
             seen.add(main_url)
@@ -193,23 +325,75 @@ def transform_base64_payload(body, sub_host, desc_map, sni_map):
     return base64.b64encode("\n".join(new_lines).encode("utf-8"))
 
 
-def transform_json_payload(body, sub_host):
-    """Normalize addresses in JSON payload for client imports."""
-    if not sub_host:
+def _rewrite_json_host_field(obj, key, bare_public, bare_connect):
+    """Rewrite a single JSON host key ('address' or 'server') in-place."""
+    val = obj.get(key)
+    if not isinstance(val, str):
+        return
+    if val.strip().lower() in ("localhost", "127.0.0.1", "::1", "[::1]") and bare_public:
+        obj[key] = bare_public
+    elif bare_connect and not _is_ip_or_local(val):
+        obj[key] = bare_connect
+
+
+def _rewrite_json_node(obj, bare_public, bare_connect):
+    """Recursively normalize server endpoints across Xray and Sing-box JSON objects."""
+    if isinstance(obj, list):
+        for item in obj:
+            _rewrite_json_node(item, bare_public, bare_connect)
+        return
+    if not isinstance(obj, dict):
+        return
+
+    if "server" in obj and ("type" in obj or "server_port" in obj):
+        _rewrite_json_host_field(obj, "server", bare_public, bare_connect)
+    if "address" in obj and ("port" in obj or "users" in obj):
+        _rewrite_json_host_field(obj, "address", bare_public, bare_connect)
+
+    for key, val in obj.items():
+        if key not in ("dns", "inbounds"):
+            _rewrite_json_node(val, bare_public, bare_connect)
+
+
+def transform_json_payload(body, sub_host, connect_ip=None):
+    """Normalize addresses in Xray [...] and Sing-box {...} JSON subscription payloads."""
+    effective_connect = _resolve_connect_ip(connect_ip)
+    bare_public = (effective_connect or sub_host or "").strip().strip("[]")
+    bare_connect = effective_connect.strip("[]")
+    if not bare_public and not bare_connect:
         return body
+
     try:
-        raw_text = body.decode("utf-8", errors="ignore")
-        if raw_text.strip().startswith("[") and ("outbounds" in raw_text or "settings" in raw_text):
-            raw_text = re.sub(r'("address"\s*:\s*)"(?:localhost|127\.0\.0\.1)"', rf'\1"{sub_host}"', raw_text)
-            return raw_text.encode("utf-8")
+        raw_text = body.decode("utf-8", errors="ignore").strip()
+        if not raw_text or raw_text[0] not in ("[", "{"):
+            return body
+        data = json.loads(raw_text)
+        _rewrite_json_node(data, bare_public, bare_connect)
+        return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     except Exception as err:
         sys.stderr.write(f"JSON normalize error: {err}\n")
-    return body
+        return body
+
+
+def _sanitize_header_value(value):
+    """Sanitize header values to Latin-1 without CR/LF/NEL injection."""
+    safe_v = str(value).replace("\r", " ").replace("\n", " ").replace("\x85", " ")
+    try:
+        safe_v.encode("latin-1")
+        return safe_v
+    except UnicodeEncodeError:
+        return safe_v.encode("utf-8", errors="ignore").decode("latin-1", errors="replace")
 
 
 class SubHandler(BaseHTTPRequestHandler):
+    """Hardened reverse proxy HTTP handler for 3X-UI subscription endpoints."""
+
     def log_message(self, format, *args):
-        pass
+        return
+
+    def send_response(self, code, message=None):
+        self.send_response_only(code, message)
+        self.send_header("Date", self.date_time_string())
 
     def do_GET(self):
         self.handle_proxy("GET")
@@ -229,39 +413,44 @@ class SubHandler(BaseHTTPRequestHandler):
             body = resp.read() if method == "GET" else b""
             return resp.status, dict(resp.headers), body
 
-    def send_error_response(self, code, msg):
+    def _send_security_headers(self):
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, private")
+        self.send_header("X-Content-Type-Options", "nosniff")
+
+    def _forward_filtered_headers(self, headers):
+        for k, v in headers.items():
+            if k.lower() in STRIPPED_RESPONSE_HEADERS:
+                continue
+            self.send_header(k, _sanitize_header_value(v))
+
+    def send_error_response(self, code, msg, method="GET"):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self._send_security_headers()
         raw_msg = msg.encode("utf-8")
         self.send_header("Content-Length", str(len(raw_msg)))
         self.end_headers()
-        self.wfile.write(raw_msg)
+        if method != "HEAD" and raw_msg:
+            self.wfile.write(raw_msg)
 
-    def send_upstream_error(self, err):
-        self.send_response(err.code)
-        for k, v in err.headers.items():
-            if k.lower() not in ("content-length", "transfer-encoding", "connection"):
-                self.send_header(k, v)
-        err_body = err.read()
+    def send_upstream_error(self, err, method="GET"):
+        try:
+            self.send_response(err.code)
+            self._forward_filtered_headers(err.headers)
+            self._send_security_headers()
+            err_body = err.read() if method != "HEAD" else b""
+        finally:
+            err.close()
         self.send_header("Content-Length", str(len(err_body)))
         self.end_headers()
-        self.wfile.write(err_body)
+        if method != "HEAD" and err_body:
+            self.wfile.write(err_body)
 
     def send_transformed_response(self, status, headers, body, method):
         self.send_response(status)
-        for k, v in headers.items():
-            if k.lower() in ("content-length", "transfer-encoding", "connection", "profile-update-interval"):
-                continue
-            # Sanitize header value to safe ASCII/Latin-1 to prevent HTTP response splitting / NEL 0x85 corruption
-            safe_v = str(v).replace("\r", " ").replace("\n", " ").replace("\x85", " ")
-            try:
-                safe_v.encode("latin-1")
-            except UnicodeEncodeError:
-                safe_v = safe_v.encode("utf-8", errors="ignore").decode("latin-1", errors="replace")
-            self.send_header(k, safe_v)
+        self._forward_filtered_headers(headers)
         self.send_header("Profile-Update-Interval", "12")
-        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, private")
-        self.send_header("X-Content-Type-Options", "nosniff")
+        self._send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if method == "GET" and body:
@@ -271,53 +460,117 @@ class SubHandler(BaseHTTPRequestHandler):
         try:
             status, headers, body = self.forward_upstream(method)
         except urllib.error.HTTPError as err:
-            self.send_upstream_error(err)
+            self.send_upstream_error(err, method=method)
             return
         except Exception as err:
-            self.send_error_response(502, f"Bad Gateway (Upstream 3X-UI unreachable): {err}")
+            self.send_error_response(502, f"Bad Gateway (Upstream 3X-UI unreachable): {err}", method=method)
             return
 
         if status == 200 and method == "GET" and body:
-            sub_host = os.environ.get("SUB_CONNECT_IP", "").strip() or SUB_PUBLIC_IP or os.environ.get("SUB_DOMAIN", "").strip()
+            connect_ip = os.environ.get("SUB_CONNECT_IP", "").strip()
+            sub_host = (
+                connect_ip
+                or os.environ.get("SUB_PUBLIC_IP", "").strip()
+                or SUB_PUBLIC_IP
+                or os.environ.get("SUB_DOMAIN", "").strip()
+            )
             desc_map, sni_map = get_host_mappings()
-            stripped_body = body.strip()
-            if stripped_body.startswith(b"[") or stripped_body.startswith(b"{"):
-                body = transform_json_payload(body, sub_host)
+            stripped_body = body.lstrip()
+            if stripped_body.startswith((b"[", b"{")):
+                body = transform_json_payload(body, sub_host, connect_ip=connect_ip)
             else:
-                body = transform_base64_payload(body, sub_host, desc_map, sni_map)
+                body = transform_base64_payload(body, sub_host, desc_map, sni_map, connect_ip=connect_ip)
 
         self.send_transformed_response(status, headers, body, method)
+
+
+def _negotiate_dual_socket(sock, ssl_ctx, client_addr):
+    """Peek first byte in worker thread to upgrade TLS connections without blocking accept."""
+    if not ssl_ctx:
+        sock.settimeout(15.0)
+        return sock
+    try:
+        sock.settimeout(3.0)
+        first_byte = sock.recv(1, socket.MSG_PEEK)
+        sock.settimeout(15.0)
+        if first_byte == b"\x16":
+            return ssl_ctx.wrap_socket(sock, server_side=True)
+    except Exception as err:
+        sys.stderr.write(f"TLS wrap notice for {client_addr[0]}: {err} (serving as plain HTTP)\n")
+        try:
+            sock.settimeout(15.0)
+        except OSError as timeout_err:
+            sys.stderr.write(f"Socket settimeout notice: {timeout_err}\n")
+    return sock
 
 
 class DualProtocolServer(ThreadingHTTPServer):
     """
     Dual-protocol HTTP and HTTPS server supporting simultaneous plain HTTP and TLS
-    on the exact same listener port via Layer-7 protocol sniffing (MSG_PEEK 0x16).
+    on the same port via non-blocking worker-thread MSG_PEEK 0x16 protocol sniffing.
     """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
     def __init__(self, server_address, RequestHandlerClass, ssl_ctx=None):
         self.ssl_ctx = ssl_ctx
+        max_conn = int(os.environ.get("SUB_MAX_CONCURRENCY", "128"))
+        self._conn_sem = threading.BoundedSemaphore(max(1, max_conn))
         super().__init__(server_address, RequestHandlerClass)
 
     def get_request(self):
         sock, addr = self.socket.accept()
-        if not self.ssl_ctx:
-            sock.settimeout(15.0)
-            return sock, addr
-
-        try:
-            sock.settimeout(5.0)
-            first_byte = sock.recv(1, socket.MSG_PEEK)
-            sock.settimeout(15.0)
-            if first_byte == b"\x16":
-                sock = self.ssl_ctx.wrap_socket(sock, server_side=True)
-        except Exception as err:
-            sys.stderr.write(f"TLS wrap notice for {addr[0]}: {err} (serving as plain HTTP)\n")
-            try:
-                sock.settimeout(15.0)
-            except OSError as timeout_err:
-                sys.stderr.write(f"Socket settimeout notice: {timeout_err}\n")
-
+        sock.settimeout(15.0)
         return sock, addr
+
+    def process_request(self, request, client_address):
+        if not self._conn_sem.acquire(blocking=False):
+            sys.stderr.write(f"Concurrency limit reached; dropping {client_address[0]}\n")
+            self.shutdown_request(request)
+            return
+        thread = threading.Thread(
+            target=self.process_request_thread,
+            args=(request, client_address),
+        )
+        thread.daemon = self.daemon_threads
+        thread.start()
+
+    def process_request_thread(self, request, client_address):
+        try:
+            negotiated = _negotiate_dual_socket(request, self.ssl_ctx, client_address)
+            super().process_request_thread(negotiated, client_address)
+        except Exception as err:
+            sys.stderr.write(f"Worker connection error for {client_address[0]}: {err}\n")
+            self.shutdown_request(request)
+        finally:
+            self._conn_sem.release()
+
+
+def resolve_listen_ports():
+    """Determine gateway listener ports, avoiding port 80 collision in Single-Port-443 mode."""
+    single_port = os.environ.get("SUB_SINGLE_PORT_443", "").strip().lower() in ("true", "1", "yes")
+    raw_env = os.environ.get("SUB_PORTS", "2096,28443,80").strip()
+    if single_port and raw_env == "2096,28443,80":
+        return [2096]
+    ports = [int(item.strip()) for item in raw_env.split(",") if item.strip().isdigit()]
+    return ports or [2096]
+
+
+def load_ssl_context():
+    """Load optional server TLS context when certificates exist and TLS is not disabled."""
+    force_no_tls = os.environ.get("SUB_ENABLE_TLS", "").strip().lower() in ("false", "0", "no")
+    if force_no_tls or not (os.path.exists(SSL_CERT) and os.path.exists(SSL_KEY)):
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=SSL_CERT, keyfile=SSL_KEY)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        print(f"[+] TLS certificates loaded successfully from {SSL_CERT} (Dual HTTP/HTTPS active)")
+        return ctx
+    except Exception as err:
+        print(f"[!] Warning: Failed to load TLS certificates ({err}). Starting in plain HTTP mode.")
+        return None
 
 
 def start_server(listen_ip, port, ssl_ctx=None):
@@ -327,26 +580,27 @@ def start_server(listen_ip, port, ssl_ctx=None):
     server.serve_forever()
 
 
-if __name__ == "__main__":
-    import threading
-
-    ssl_context = None
-    force_no_tls = os.environ.get("SUB_ENABLE_TLS", "").strip().lower() in ("false", "0", "no")
-    if not force_no_tls and os.path.exists(SSL_CERT) and os.path.exists(SSL_KEY):
+def run_gateway_servers(listen_ip, ports, ssl_ctx=None):
+    """Bind all requested listener ports resiliently and serve concurrently."""
+    servers = []
+    for port in ports:
         try:
-            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ssl_context.load_cert_chain(certfile=SSL_CERT, keyfile=SSL_KEY)
-            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-            print(f"[+] TLS certificates loaded successfully from {SSL_CERT} (Dual HTTP/HTTPS active)")
-        except Exception as err:
-            print(f"[!] Warning: Failed to load TLS certificates ({err}). Starting in plain HTTP mode.")
-            ssl_context = None
+            srv = DualProtocolServer((listen_ip, port), SubHandler, ssl_ctx)
+            proto = "Dual (HTTP/HTTPS)" if ssl_ctx else "HTTP (Plain)"
+            print(f"[*] Sub-Enhancer listening on {listen_ip}:{port} ({proto})")
+            servers.append(srv)
+        except OSError as err:
+            sys.stderr.write(f"[!] Warning: Could not bind {listen_ip}:{port}: {err}\n")
 
-    raw_ports = os.environ.get("SUB_PORTS", "2096,28443,80").split(",")
-    ports = [int(p.strip()) for p in raw_ports if p.strip()]
+    if not servers:
+        sys.stderr.write("[!] Fatal: Failed to bind any subscription gateway port.\n")
+        sys.exit(1)
 
-    for p in ports[:-1]:
-        t = threading.Thread(target=start_server, args=(SUB_LISTEN, p, ssl_context), daemon=True)
+    for srv in servers[:-1]:
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
+    servers[-1].serve_forever()
 
-    start_server(SUB_LISTEN, ports[-1], ssl_context)
+
+if __name__ == "__main__":
+    run_gateway_servers(SUB_LISTEN, resolve_listen_ports(), load_ssl_context())

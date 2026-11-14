@@ -83,46 +83,65 @@ def register_warp(pub_b64):
             raise RuntimeError(f"Cloudflare registration HTTP {resp.status}")
         return json.loads(resp.read().decode("utf-8"))
 
+def decode_reserved_bytes(client_id_raw: str) -> list[int]:
+    """Decode base64 Cloudflare client_id into a 3-byte WireGuard reserved field."""
+    if not client_id_raw:
+        return [0, 0, 0]
+    try:
+        raw_bytes = base64.b64decode(client_id_raw, validate=True)
+    except Exception as err:
+        sys.stderr.write(f"[!] Invalid WARP client_id encoding ({err}); defaulting reserved to [0, 0, 0]\n")
+        return [0, 0, 0]
+    if len(raw_bytes) != 3:
+        sys.stderr.write(f"[!] Unexpected client_id byte length ({len(raw_bytes)}); defaulting reserved to [0, 0, 0]\n")
+        return [0, 0, 0]
+    return list(raw_bytes)
+
+
+def extract_peer_config(peers: list) -> tuple[str, str]:
+    """Extract Cloudflare WARP peer public key and endpoint from API response."""
+    default_pub = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+    default_endpoint = "engage.cloudflareclient.com:2408"
+    if not peers or not isinstance(peers[0], dict):
+        return default_pub, default_endpoint
+
+    peer = peers[0]
+    peer_pub = peer.get("public_key") or default_pub
+    endpoint_obj = peer.get("endpoint", {})
+    if isinstance(endpoint_obj, dict):
+        peer_endpoint = endpoint_obj.get("host") or default_endpoint
+    elif isinstance(endpoint_obj, str) and endpoint_obj.strip():
+        peer_endpoint = endpoint_obj.strip()
+    else:
+        peer_endpoint = default_endpoint
+    return peer_pub, peer_endpoint
+
+
+def _extract_interface_addresses(config: dict) -> list[str]:
+    """Extract IPv4/IPv6 CIDR addresses from WARP interface config."""
+    iface = config.get("interface", {}).get("addresses", {})
+    v4_addr = iface.get("v4") or "192.0.2.2"
+    if "/" not in v4_addr:
+        v4_addr = f"{v4_addr}/32"
+
+    addresses = [v4_addr]
+    v6_addr = iface.get("v6", "")
+    if v6_addr:
+        if "/" not in v6_addr:
+            v6_addr = f"{v6_addr}/128"
+        addresses.append(v6_addr)
+    return addresses
+
+
 def build_xray_outbound(priv_b64, reg_response):
     """Constructs Xray Core native WireGuard outbound configuration object."""
     config = reg_response.get("result", {}).get("config", {})
     if not config:
         config = reg_response.get("config", {})
 
-    v4_addr = config.get("interface", {}).get("addresses", {}).get("v4", "192.0.2.2")
-    if not v4_addr.endswith("/32"):
-        v4_addr = f"{v4_addr}/32"
-
-    v6_addr = config.get("interface", {}).get("addresses", {}).get("v6", "")
-    addresses = [v4_addr]
-    if v6_addr:
-        if not v6_addr.endswith("/128"):
-            v6_addr = f"{v6_addr}/128"
-        addresses.append(v6_addr)
-
-    client_id_raw = config.get("client_id", "")
-    if client_id_raw:
-        try:
-            reserved = list(base64.b64decode(client_id_raw))
-        except Exception:
-            reserved = [0, 0, 0]
-    else:
-        reserved = [0, 0, 0]
-
-    peers = config.get("peers", [])
-    peer_pub = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
-    peer_endpoint = "engage.cloudflareclient.com:2408"
-
-    if peers:
-        p = peers[0]
-        peer_pub = p.get("public_key", peer_pub)
-        endpoint_obj = p.get("endpoint", {})
-        if isinstance(endpoint_obj, dict):
-            host = endpoint_obj.get("host", "engage.cloudflareclient.com:2408")
-            if host:
-                peer_endpoint = host
-        elif isinstance(endpoint_obj, str) and endpoint_obj:
-            peer_endpoint = endpoint_obj
+    addresses = _extract_interface_addresses(config)
+    reserved = decode_reserved_bytes(config.get("client_id", ""))
+    peer_pub, peer_endpoint = extract_peer_config(config.get("peers", []))
 
     return {
         "tag": "warp-wireguard",
@@ -142,6 +161,67 @@ def build_xray_outbound(priv_b64, reg_response):
         }
     }
 
+
+def write_secure_json(path: str, payload: dict) -> None:
+    """Write JSON configuration with LF endings and strict 0600 permissions."""
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError as err:
+        sys.stderr.write(f"[!] Note: Could not apply chmod 0600 to {path}: {err}\n")
+
+
+def _is_ai_quic_block_rule(rule: dict) -> bool:
+    """Return True if routing rule is the legacy UDP/443 AI QUIC block."""
+    return (
+        rule.get("outboundTag") == "blocked"
+        and rule.get("network") == "udp"
+        and str(rule.get("port", "")) == "443"
+    )
+
+
+def apply_outbound_to_template(template_path: str, outbound: dict) -> None:
+    """Update an Xray template JSON file with the native WireGuard outbound."""
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"Template file {template_path} not found")
+
+    with open(template_path, "r", encoding="utf-8") as f:
+        template = json.load(f)
+
+    new_outbounds = []
+    inserted = False
+    for out in template.get("outbounds", []):
+        tag = out.get("tag")
+        if tag == "warp-socks":
+            continue
+        if tag == "warp-wireguard":
+            new_outbounds.append(outbound)
+            inserted = True
+        else:
+            new_outbounds.append(out)
+    if not inserted:
+        new_outbounds.append(outbound)
+    template["outbounds"] = new_outbounds
+
+    routing = template.setdefault("routing", {})
+    filtered_rules = []
+    for rule in routing.get("rules", []):
+        if _is_ai_quic_block_rule(rule):
+            continue
+        updated_rule = dict(rule)
+        if updated_rule.get("outboundTag") == "warp-socks":
+            updated_rule["outboundTag"] = "warp-wireguard"
+        filtered_rules.append(updated_rule)
+    routing["rules"] = filtered_rules
+
+    write_secure_json(template_path, template)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cloudflare WARP Native WireGuard Outbound Generator")
     parser.add_argument("--output", "-o", help="Path to write outbound JSON configuration")
@@ -156,49 +236,12 @@ def main():
 
         if args.print_json or (not args.output and not args.update_template):
             print(json.dumps(outbound, indent=2))
-
         if args.output:
-            os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-            with open(args.output, "w", encoding="utf-8") as f:
-                json.dump(outbound, f, indent=2)
+            write_secure_json(args.output, outbound)
             print(f"[+] Outbound configuration saved to {args.output}")
-
         if args.update_template:
-            if os.path.exists(args.update_template):
-                with open(args.update_template, "r", encoding="utf-8") as f:
-                    template = json.load(f)
-
-                outbounds = template.get("outbounds", [])
-                # Replace existing warp outbound or append
-                replaced = False
-                for idx, out in enumerate(outbounds):
-                    if out.get("tag") in ("warp-socks", "warp-wireguard"):
-                        outbounds[idx] = outbound
-                        replaced = True
-                        break
-                if not replaced:
-                    outbounds.append(outbound)
-                template["outbounds"] = outbounds
-
-                # Update routing rules to route to warp-wireguard and remove UDP:443 AI block
-                rules = template.get("routing", {}).get("rules", [])
-                filtered_rules = []
-                for r in rules:
-                    # Remove the blocked rule for UDP:443 on AI domains since WireGuard handles UDP natively
-                    if r.get("outboundTag") == "blocked" and r.get("network") == "udp" and r.get("port") == "443":
-                        continue
-                    if r.get("outboundTag") == "warp-socks":
-                        r["outboundTag"] = "warp-wireguard"
-                    filtered_rules.append(r)
-                template["routing"]["rules"] = filtered_rules
-
-                with open(args.update_template, "w", encoding="utf-8") as f:
-                    json.dump(template, f, indent=2)
-                print(f"[+] Successfully updated {args.update_template} with native WireGuard outbound")
-            else:
-                print(f"[-] Error: Template file {args.update_template} not found", file=sys.stderr)
-                sys.exit(1)
-
+            apply_outbound_to_template(args.update_template, outbound)
+            print(f"[+] Successfully updated {args.update_template} with native WireGuard outbound")
     except Exception as e:
         print(f"[-] WARP WireGuard generation failed: {e}", file=sys.stderr)
         sys.exit(1)

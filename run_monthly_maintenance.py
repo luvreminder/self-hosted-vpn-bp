@@ -107,11 +107,9 @@ if row:
     
     # Short ID rotation: purge known sample keys from public templates (preserve active user sids)
     public_compromised_sids = {
-        "0123456789abcdef", "1234567890abcdef"
+        "0123456789abcdef", "1234567890abcdef", "859a72d4fa0c9a5e"
     }
     existing_sids = set(reality.get("shortIds", [])) - public_compromised_sids
-    # Always keep the primary production Short ID active for backwards compatibility
-    existing_sids.add("859a72d4fa0c9a5e")
     
     # Generate fresh cryptographically secure 8-byte hex tokens
     while len(existing_sids) < 4:
@@ -256,182 +254,141 @@ cur.execute("SELECT value FROM settings WHERE key='xrayTemplateConfig';")
 t_row = cur.fetchone()
 config = json.loads(t_row[0]) if t_row else {}
 
-# Inbounds
-config["inbounds"] = [
-    {
-        "tag": "api",
-        "listen": "127.0.0.1",
-        "port": 62789,
-        "protocol": "dokodemo-door",
-        "settings": {
-            "address": "127.0.0.1"
-        }
-    }
-]
+def _detect_native_wireguard_outbound(existing_config, wg_file="/etc/x-ui/warp_wireguard.json"):
+    for out in existing_config.get("outbounds", []):
+        if out.get("tag") == "warp-wireguard":
+            sec = out.get("settings", {}).get("secretKey", "")
+            if sec and sec != "GENERATE_VIA_WARP_API":
+                return out
+    if wg_file and os.path.exists(wg_file):
+        try:
+            with open(wg_file, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            sec = loaded.get("settings", {}).get("secretKey", "")
+            if loaded.get("tag") == "warp-wireguard" and sec and sec != "GENERATE_VIA_WARP_API":
+                return loaded
+        except Exception as err:
+            print(f"[!] Note: Failed reading {wg_file}: {err}")
+    return None
 
-# API & Stats
-config["api"] = {
-    "tag": "api",
-    "services": [
-        "HandlerService",
-        "LoggerService",
-        "StatsService",
-        "RoutingService"
+def build_xray_template_config(existing_config, wg_file="/etc/x-ui/warp_wireguard.json"):
+    config = dict(existing_config) if isinstance(existing_config, dict) else {}
+    config["inbounds"] = [
+        {
+            "tag": "api",
+            "listen": "127.0.0.1",
+            "port": 62789,
+            "protocol": "dokodemo-door",
+            "settings": {"address": "127.0.0.1"}
+        }
     ]
-}
-config["stats"] = {}
-config["policy"] = {
-    "levels": {
-        "0": {
-            "statsUserUplink": True,
-            "statsUserDownlink": True
-        }
-    },
-    "system": {
-        "statsInboundUplink": True,
-        "statsInboundDownlink": True,
-        "statsOutboundUplink": True,
-        "statsOutboundDownlink": True
+    config["api"] = {
+        "tag": "api",
+        "services": ["HandlerService", "LoggerService", "StatsService", "RoutingService"]
     }
-}
+    config["stats"] = {}
+    config["policy"] = {
+        "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
+        "system": {
+            "statsInboundUplink": True,
+            "statsInboundDownlink": True,
+            "statsOutboundUplink": True,
+            "statsOutboundDownlink": True
+        }
+    }
 
-# Outbounds
-config["outbounds"] = [
-    {
+    direct_outbound = {
         "tag": "direct",
         "protocol": "freedom",
-        "settings": {
-            "domainStrategy": "UseIPv4"
-        }
-    },
-    {
-        "tag": "warp-socks",
-        "protocol": "socks",
-        "settings": {
-            "servers": [
-                {
-                    "address": "127.0.0.1",
-                    "port": 40000
-                }
-            ]
-        }
-    },
-    {
-        "tag": "blocked",
-        "protocol": "blackhole",
-        "settings": {
-            "response": {
-                "type": "http"
+        "settings": {"domainStrategy": "UseIPv4"},
+        "streamSettings": {
+            "sockopt": {
+                "tcpKeepAliveIdle": 20,
+                "tcpKeepAliveInterval": 5,
+                "tcpNoDelay": True
             }
         }
     }
-]
+    warp_socks_outbound = {
+        "tag": "warp-socks",
+        "protocol": "socks",
+        "settings": {"servers": [{"address": "127.0.0.1", "port": 40000}]}
+    }
+    blocked_outbound = {
+        "tag": "blocked",
+        "protocol": "blackhole",
+        "settings": {"response": {"type": "http"}}
+    }
 
-# Extended list of AI services routed via Cloudflare WARP (excluding Google Gemini which uses clean direct German IP)
-ai_domains = [
-    # Geosite groups
-    "geosite:openai",
-    "geosite:anthropic",
-    "geosite:perplexity",
-    # OpenAI, ChatGPT, Sora
-    "domain:openai.com",
-    "domain:chatgpt.com",
-    "domain:oaistatic.com",
-    "domain:oaiusercontent.com",
-    "domain:sora.com",
-    "domain:ai.com",
-    "domain:chat.openai.com",
-    "domain:auth0.openai.com",
-    "domain:client-api.arkoselabs.com",
-    "domain:featuregates.org",
-    "domain:statsig.com",
-    "domain:statsigapi.net",
-    # Anthropic & Claude
-    "domain:anthropic.com",
-    "domain:claude.ai",
-    "domain:claude.com",
-    # Coding & Development AI
-    "domain:cursor.sh",
-    "domain:cursor.com",
-    "domain:cursor-cdn.com",
-    "domain:copilot.microsoft.com",
-    # Additional AI Services
-    "domain:perplexity.ai",
-    "domain:midjourney.com",
-    "domain:x.ai",
-    "domain:grok.com",
-    "domain:deepseek.com",
-    "domain:mistral.ai",
-    "domain:cohere.com"
-]
+    ai_domains = [
+        "geosite:openai",
+        "geosite:anthropic",
+        "geosite:perplexity",
+        "domain:openai.com",
+        "domain:chatgpt.com",
+        "domain:oaistatic.com",
+        "domain:oaiusercontent.com",
+        "domain:sora.com",
+        "domain:ai.com",
+        "domain:chat.openai.com",
+        "domain:auth0.openai.com",
+        "domain:client-api.arkoselabs.com",
+        "domain:featuregates.org",
+        "domain:statsig.com",
+        "domain:statsigapi.net",
+        "domain:anthropic.com",
+        "domain:claude.ai",
+        "domain:claude.com",
+        "domain:cursor.sh",
+        "domain:cursor.com",
+        "domain:cursor-cdn.com",
+        "domain:copilot.microsoft.com",
+        "domain:perplexity.ai",
+        "domain:midjourney.com",
+        "domain:x.ai",
+        "domain:grok.com",
+        "domain:deepseek.com",
+        "domain:mistral.ai",
+        "domain:cohere.com"
+    ]
 
-config["routing"] = {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-        {
-            "type": "field",
-            "inboundTag": ["api"],
-            "outboundTag": "api"
-        },
-        {
-            "type": "field",
-            "outboundTag": "blocked",
-            "protocol": ["bittorrent"]
-        },
-        {
-            "type": "field",
-            "outboundTag": "blocked",
-            "ip": ["geoip:private"]
-        },
-        {
-            "type": "field",
-            "outboundTag": "blocked",
-            "domain": ["geosite:category-ads-all"]
-        },
-        # Block QUIC (UDP 443) for AI services to prevent stalled connections over WARP
-        {
+    warp_wg_outbound = _detect_native_wireguard_outbound(config, wg_file=wg_file)
+    if warp_wg_outbound is not None:
+        config["outbounds"] = [direct_outbound, warp_wg_outbound, blocked_outbound]
+        ai_outbound_tag = "warp-wireguard"
+    else:
+        config["outbounds"] = [direct_outbound, warp_socks_outbound, blocked_outbound]
+        ai_outbound_tag = "warp-socks"
+
+    rules = [
+        {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+        {"type": "field", "outboundTag": "blocked", "protocol": ["bittorrent"]},
+        {"type": "field", "outboundTag": "blocked", "ip": ["geoip:private"]},
+        {"type": "field", "outboundTag": "blocked", "domain": ["geosite:category-ads-all"]}
+    ]
+    if warp_wg_outbound is None:
+        rules.append({
             "type": "field",
             "outboundTag": "blocked",
             "port": "443",
             "network": "udp",
-            "domain": [
-                "geosite:openai",
-                "geosite:anthropic",
-                "geosite:perplexity",
-                "domain:openai.com",
-                "domain:chatgpt.com",
-                "domain:anthropic.com",
-                "domain:claude.ai",
-                "domain:perplexity.ai"
-            ]
-        },
-        {
-            "type": "field",
-            "outboundTag": "warp-socks",
             "domain": ai_domains
-        },
-        {
-            "type": "field",
-            "outboundTag": "direct",
-            "network": "tcp,udp"
-        }
-    ]
-}
+        })
+    rules.append({"type": "field", "outboundTag": ai_outbound_tag, "domain": ai_domains})
+    rules.append({"type": "field", "outboundTag": "direct", "network": "tcp,udp"})
 
-config["dns"] = {
-    "servers": [
-        "1.1.1.1",
-        "8.8.8.8",
-        "1.0.0.1",
-        "localhost"
-    ],
-    "queryStrategy": "UseIPv4"
-}
+    config["routing"] = {"domainStrategy": "IPIfNonMatch", "rules": rules}
+    config["dns"] = {
+        "servers": ["1.1.1.1", "8.8.8.8", "1.0.0.1", "localhost"],
+        "queryStrategy": "UseIPv4"
+    }
+    return config, ai_outbound_tag, len(ai_domains)
 
+config, active_warp_tag, ai_count = build_xray_template_config(config)
 cur.execute("UPDATE settings SET value=? WHERE key='xrayTemplateConfig';", (json.dumps(config, indent=2),))
 conn.commit()
 conn.close()
-print(f"[OK] Xray template updated: {len(ai_domains)} AI domains routed via Cloudflare WARP.")
+print(f"[OK] Xray template updated: {ai_count} AI domains routed via {active_warp_tag}.")
 
 # -------------------------------------------------------------
 # STEP 5: SQLite Database Maintenance and Compaction
@@ -516,11 +473,15 @@ echo "[*] Cleaning logs..."
 journalctl --vacuum-time=14d --vacuum-size=100M || true
 
 # 4. Check WARP status and reconnect if needed
-if ! curl -s -x socks5h://127.0.0.1:40000 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
-    echo "[!] WARP connection issue detected. Reconnecting..."
-    systemctl restart warp-svc || true
-    sleep 3
-    warp-cli --accept-tos connect || true
+if [ -f /etc/x-ui/warp_wireguard.json ] || sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='xrayTemplateConfig';" 2>/dev/null | grep -q '"warp-wireguard"'; then
+    echo "[OK] Native WireGuard WARP outbound configured in Xray Core (0 MB daemon mode)."
+elif systemctl list-unit-files warp-svc.service 2>/dev/null | grep -q warp-svc && systemctl is-enabled --quiet warp-svc 2>/dev/null; then
+    if ! curl -s -x socks5h://127.0.0.1:40000 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+        echo "[!] WARP connection issue detected. Reconnecting..."
+        systemctl restart warp-svc || true
+        sleep 3
+        warp-cli --accept-tos connect || true
+    fi
 fi
 
 # 5. Restart services
@@ -572,78 +533,161 @@ print("[OK] Systemd Timer vps-maintenance.timer activated (schedule: 1st of ever
 print("\n=== [✓] MONTHLY VPS MAINTENANCE COMPLETED SUCCESSFULLY ===")
 """
 
-def resolve_credentials(args):
-    host = args.host or os.environ.get("VPS_HOST")
-    port = args.port or int(os.environ.get("VPS_SSH_PORT", "22"))
-    user = args.user or os.environ.get("VPS_USER", "root")
-    password = args.password or os.environ.get("VPS_PASSWORD")
-    key_path = args.key or os.environ.get("VPS_SSH_KEY")
+def _is_placeholder(value):
+    return not value or value.startswith("YOUR_") or value.startswith("<")
 
-    # Look for local credentials.txt across probable workspace paths
+
+def _parse_int_port(value):
+    if value and value.isdigit():
+        num = int(value)
+        if 1 <= num <= 65535:
+            return num
+    return None
+
+
+_GLOBAL_CRED_KEYS = {
+    "SSH_PORT": "port",
+    "SSH_USER": "user",
+    "SSH_PASSWORD": "password",
+    "ROOT_PASSWORD": "password",
+    "SSH_KEY_PATH": "key_path",
+    "SSH_KEY": "key_path",
+}
+_SERVER_CRED_KEYS = {
+    "IP": "host",
+    "HOST": "host",
+    "SERVER_IP": "host",
+    "SERVER": "host",
+    "PORT": "port",
+    "USER": "user",
+    "PASSWORD": "password",
+    "KEY_PATH": "key_path",
+}
+
+
+def _apply_cred_kv(creds, section, key, val):
+    if _is_placeholder(val):
+        return
+    field = _GLOBAL_CRED_KEYS.get(key)
+    if field is None and section in ("", "SERVER"):
+        field = _SERVER_CRED_KEYS.get(key)
+    if field is None or creds[field]:
+        return
+    if field == "port":
+        creds["port"] = _parse_int_port(val)
+        return
+    if field == "key_path":
+        expanded = os.path.expandvars(os.path.expanduser(val))
+        if os.path.isfile(expanded):
+            creds["key_path"] = expanded
+        return
+    creds[field] = val
+
+
+def _parse_credentials_file(filepath):
+    parsed = {"host": None, "port": None, "user": None, "password": None, "key_path": None}
+    section = ""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1].strip().upper()
+                    continue
+                delim = "=" if "=" in line else (":" if ":" in line else None)
+                if not delim:
+                    continue
+                key, val = line.split(delim, 1)
+                _apply_cred_kv(parsed, section, key.strip().upper(), val.strip().strip('"').strip("'"))
+    except OSError as err:
+        sys.stderr.write(f"[!] Note: Could not read {filepath}: {err}\n")
+    return parsed
+
+
+def _merge_file_credentials(creds):
     cred_paths = [
         "credentials.txt",
         "../credentials.txt",
         os.path.join(os.path.dirname(__file__), "..", "credentials.txt"),
-        os.path.join(os.path.dirname(__file__), "credentials.txt")
+        os.path.join(os.path.dirname(__file__), "credentials.txt"),
     ]
-    for p in cred_paths:
-        if os.path.exists(p):
-            try:
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#") or line.startswith("["):
-                            continue
-                        # Delimiter detection: '=' or ':'
-                        delim = "=" if "=" in line else (":" if ":" in line else None)
-                        if delim:
-                            k, v = line.split(delim, 1)
-                            k = k.strip().upper()
-                            v = v.strip().strip('"').strip("'")
-                            if not host and (k in ("IP", "HOST", "SERVER_IP", "SERVER") or "IP" in k):
-                                if v and not v.startswith("YOUR_") and not v.startswith("<"):
-                                    host = v
-                            if not port and (k in ("SSH_PORT", "PORT") or "PORT" in k):
-                                try:
-                                    port = int(v)
-                                except ValueError:
-                                    pass
-                            if not user and (k in ("SSH_USER", "USER", "USERNAME") or "USER" in k):
-                                if v and not v.startswith("YOUR_"):
-                                    user = v
-                            if not password and (k in ("PASSWORD", "SSH_PASSWORD", "ROOT_PASSWORD") or "PASS" in k):
-                                if v and not v.startswith("YOUR_") and not v.startswith("<"):
-                                    password = v
-                            if not key_path and (k in ("SSH_KEY_PATH", "SSH_KEY", "KEY_PATH", "KEY") or "KEY" in k):
-                                if v and not v.startswith("<") and not v.startswith("YOUR_"):
-                                    expanded = os.path.expandvars(os.path.expanduser(v))
-                                    if os.path.exists(expanded):
-                                        key_path = expanded
-            except Exception:
-                pass
-            if host and (password or key_path):
-                break
+    for path in cred_paths:
+        if not os.path.exists(path):
+            continue
+        parsed = _parse_credentials_file(path)
+        for field, value in parsed.items():
+            if not creds[field] and value is not None:
+                creds[field] = value
+        if creds["host"] and (creds["password"] or creds["key_path"]):
+            break
 
-    if not key_path:
-        for default_key in ["~/.ssh/id_ed25519", "~/.ssh/vps_ed25519", "~/.ssh/id_rsa"]:
-            expanded = os.path.expanduser(default_key)
-            if os.path.exists(expanded):
-                key_path = expanded
-                break
 
-    return host, port, user, password, key_path
+def _find_default_ssh_key():
+    for default_key in ("~/.ssh/id_ed25519", "~/.ssh/vps_ed25519", "~/.ssh/id_rsa"):
+        expanded = os.path.expanduser(default_key)
+        if os.path.isfile(expanded):
+            return expanded
+    return None
+
+
+def resolve_credentials(args):
+    creds = {
+        "host": args.host or os.environ.get("VPS_HOST"),
+        "port": args.port or _parse_int_port(os.environ.get("VPS_SSH_PORT", "")),
+        "user": args.user or os.environ.get("VPS_USER"),
+        "password": args.password or os.environ.get("VPS_PASSWORD"),
+        "key_path": args.key or os.environ.get("VPS_SSH_KEY"),
+    }
+    _merge_file_credentials(creds)
+    if not creds["key_path"]:
+        creds["key_path"] = _find_default_ssh_key()
+    return (
+        creds["host"],
+        creds["port"] or 22,
+        creds["user"] or "root",
+        creds["password"],
+        creds["key_path"],
+    )
+
+
+def _execute_remote_maintenance(ssh, user):
+    remote_dir = "/root" if user == "root" else "/tmp"
+    remote_tmp = f"{remote_dir}/.vps_maintenance_{secrets.token_hex(6)}.py"
+
+    print("[*] Uploading maintenance script...")
+    sftp = ssh.open_sftp()
+    try:
+        with sftp.file(remote_tmp, "w") as f:
+            f.write(REMOTE_SCRIPT)
+        sftp.chmod(remote_tmp, 0o700)
+    finally:
+        sftp.close()
+
+    try:
+        print("[*] Executing remote maintenance...")
+        _, stdout, stderr = ssh.exec_command(f"python3 {remote_tmp}", get_pty=True)
+        for line in stdout:
+            print(line, end="")
+        err = stderr.read().decode("utf-8", errors="replace")
+        if err:
+            print("\n[STDERR]:\n" + err)
+        return stdout.channel.recv_exit_status()
+    finally:
+        ssh.exec_command(f"rm -f {remote_tmp}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="VPS Monthly Maintenance & Anti-Censorship Sync")
     parser.add_argument("--host", help="VPS IP address or hostname")
-    parser.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
-    parser.add_argument("--user", default="root", help="SSH username (default: root)")
+    parser.add_argument("--port", type=int, default=None, help="SSH port (default: 22)")
+    parser.add_argument("--user", default=None, help="SSH username (default: root)")
     parser.add_argument("--password", help="SSH password")
     parser.add_argument("--key", help="Path to SSH private key")
     args = parser.parse_args()
 
     host, port, user, password, key_path = resolve_credentials(args)
-
     if not host:
         print("[!] Error: VPS host IP address is required.")
         print("    Specify via argument: python run_monthly_maintenance.py --host <IP>")
@@ -652,38 +696,24 @@ def main():
 
     print(f"[*] Connecting to server {host}:{port} as {user}...")
     ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.load_system_host_keys()
+    ssh.set_missing_host_key_policy(paramiko.WarningPolicy())
 
-    connect_kwargs = {
-        "hostname": host,
-        "port": port,
-        "username": user,
-        "timeout": 15
-    }
+    connect_kwargs = {"hostname": host, "port": port, "username": user, "timeout": 15}
     if key_path and os.path.exists(key_path):
         connect_kwargs["key_filename"] = key_path
     elif password:
         connect_kwargs["password"] = password
 
-    ssh.connect(**connect_kwargs)
+    exit_code = 0
+    try:
+        ssh.connect(**connect_kwargs)
+        exit_code = _execute_remote_maintenance(ssh, user)
+    finally:
+        ssh.close()
 
-    print("[*] Uploading maintenance script...")
-    sftp = ssh.open_sftp()
-    with sftp.file("/tmp/run_maintenance.py", "w") as f:
-        f.write(REMOTE_SCRIPT)
-    sftp.close()
-
-    print("[*] Executing remote maintenance...")
-    stdin, stdout, stderr = ssh.exec_command("python3 /tmp/run_maintenance.py", get_pty=True)
-
-    for line in stdout:
-        print(line, end="")
-
-    err = stderr.read().decode('utf-8', errors='replace')
-    if err:
-        print("\n[STDERR]:\n" + err)
-
-    ssh.close()
+    if exit_code != 0:
+        sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()

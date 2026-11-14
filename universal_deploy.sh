@@ -82,6 +82,10 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --sub-ports)
+            if [[ $# -lt 2 || -z "${2:-}" ]]; then
+                echo "❌ Error: --sub-ports requires a comma-separated port list." >&2
+                exit 1
+            fi
             SUB_PORTS="$2"
             shift 2
             ;;
@@ -193,7 +197,7 @@ case "$OS_ID" in
         apt update -y
         apt install -y curl wget git jq sqlite3 iptables python3 python3-pip gpg lsb-release ca-certificates
         if [ "$SINGLE_PORT_443" = true ]; then
-            apt install -y nginx
+            apt install -y nginx libnginx-mod-stream || apt install -y nginx
         fi
         # Install iptables persistence utility non-interactively
         echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections || true
@@ -210,34 +214,49 @@ case "$OS_ID" in
         ;;
 esac
 
-# 7. Kernel performance tuning (TCP BBR + Anti-DPI TCP KeepAlive + ICMP Handling)
-echo "⚡ Configuring kernel: Enabling TCP BBR & Anti-DPI TCP KeepAlive..."
-sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_keepalive_time/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_keepalive_intvl/d' /etc/sysctl.conf
-sed -i '/net.ipv4.tcp_keepalive_probes/d' /etc/sysctl.conf
-sed -i '/net.ipv4.icmp_echo_ignore_all/d' /etc/sysctl.conf
-
-echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_keepalive_time=20" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_keepalive_intvl=5" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_keepalive_probes=4" >> /etc/sysctl.conf
-if [ "$STEALTH_ICMP" = true ]; then
-    echo "net.ipv4.icmp_echo_ignore_all=1" >> /etc/sysctl.conf
-else
-    echo "net.ipv4.icmp_echo_ignore_all=0" >> /etc/sysctl.conf
+# 7. Kernel performance tuning (TCP BBR + Anti-DPI TCP KeepAlive + MTU Probing + ICMP Handling)
+echo "⚡ Configuring kernel: Enabling TCP BBR, MTU Probing, TFO & Anti-DPI TCP KeepAlive..."
+if [ -f /etc/sysctl.conf ]; then
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_keepalive_time/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_keepalive_intvl/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_keepalive_probes/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_mtu_probing/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.icmp_echo_ignore_all/d' /etc/sysctl.conf
 fi
-sysctl -p
 
-# 8. Host protection against BitTorrent (Layer-7 Anti-DMCA) & UDP Port Hopping
-echo "🛡️ Deploying Layer-7 BitTorrent packet filters (Host & Forwarding)..."
-for chain in OUTPUT FORWARD; do
-    for proto in tcp udp; do
-        for str in "BitTorrent" "BitTorrent protocol"; do
-            iptables -C "$chain" -p "$proto" -m string --string "$str" --algo bm -j DROP 2>/dev/null || \
-            iptables -I "$chain" -p "$proto" -m string --string "$str" --algo bm -j DROP || true
+mkdir -p /etc/sysctl.d
+ICMP_IGNORE_VAL=0
+if [ "$STEALTH_ICMP" = true ]; then
+    ICMP_IGNORE_VAL=1
+fi
+cat << SYSCTL_EOF > /etc/sysctl.d/99-sota-vpn.conf
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_keepalive_time=20
+net.ipv4.tcp_keepalive_intvl=5
+net.ipv4.tcp_keepalive_probes=4
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_fastopen=3
+net.ipv4.icmp_echo_ignore_all=$ICMP_IGNORE_VAL
+SYSCTL_EOF
+sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-sota-vpn.conf
+
+# 8. Host protection against BitTorrent (Layer-7 Anti-DMCA IPv4 & IPv6) & UDP Port Hopping
+echo "🛡️ Deploying Layer-7 BitTorrent packet filters (Host & Forwarding, IPv4 & IPv6)..."
+FW_BINS=("iptables")
+if command -v ip6tables >/dev/null 2>&1; then
+    FW_BINS+=("ip6tables")
+fi
+for fw_bin in "${FW_BINS[@]}"; do
+    for chain in OUTPUT FORWARD; do
+        for proto in tcp udp; do
+            for str in "BitTorrent" "BitTorrent protocol" "peer_id=" ".torrent" "announce.php?passkey="; do
+                "$fw_bin" -C "$chain" -p "$proto" -m string --string "$str" --algo bm -j DROP 2>/dev/null || \
+                "$fw_bin" -I "$chain" -p "$proto" -m string --string "$str" --algo bm -j DROP || true
+            done
         done
     done
 done
@@ -248,9 +267,12 @@ if [ "$ENABLE_HYSTERIA" = true ]; then
     iptables -t nat -A PREROUTING -p udp --dport 20000:50000 -j REDIRECT --to-ports 443 || true
 fi
 
-# Persist iptables rules across reboots
+# Persist iptables & ip6tables rules across reboots
 if [ "$OS_ID" = "rocky" ] || [ "$OS_ID" = "almalinux" ] || [ "$OS_ID" = "rhel" ]; then
     service iptables save || true
+    if command -v ip6tables-save >/dev/null 2>&1 && [ -d /etc/sysconfig ]; then
+        ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true
+    fi
 elif [ "$OS_ID" = "ubuntu" ] || [ "$OS_ID" = "debian" ]; then
     netfilter-persistent save || true
 fi
@@ -298,15 +320,25 @@ case "$OS_ID" in
         ;;
 esac
 
+# Initialize Xray/3X-UI paths before WARP provisioning (never mutate git-tracked template)
+DB_PATH="/etc/x-ui/x-ui.db"
+TEMPLATE_FILE="$SCRIPT_DIR/xray_template_config.json"
+APPLIED_TEMPLATE="/etc/x-ui/xray_template_applied.json"
+HOST_IP=""
+mkdir -p /etc/x-ui && chmod 700 /etc/x-ui || true
+if [ -f "$TEMPLATE_FILE" ]; then
+    install -m 600 "$TEMPLATE_FILE" "$APPLIED_TEMPLATE"
+fi
+
 # 10. Deploy Cloudflare WARP Outbound (Native WireGuard or SOCKS5)
 WARP_SUCCESS=false
 if [ "$SKIP_WARP" = false ]; then
     if [ "$NATIVE_WARP" = true ]; then
         echo "🌐 Deploying Next-Gen Cloudflare WARP Native WireGuard Outbound (0 MB daemon RAM)..."
         WARP_GEN_SCRIPT="$SCRIPT_DIR/generate_warp_wireguard.py"
-        if [ -f "$WARP_GEN_SCRIPT" ]; then
-            if python3 "$WARP_GEN_SCRIPT" --update-template "$TEMPLATE_FILE" --output /etc/x-ui/warp_wireguard.json; then
-                echo "✅ Native WireGuard outbound registered and applied to Xray template."
+        if [ -f "$WARP_GEN_SCRIPT" ] && [ -f "$APPLIED_TEMPLATE" ]; then
+            if python3 "$WARP_GEN_SCRIPT" --update-template "$APPLIED_TEMPLATE" --output /etc/x-ui/warp_wireguard.json; then
+                echo "✅ Native WireGuard outbound registered and applied to /etc/x-ui/xray_template_applied.json."
                 WARP_SUCCESS=true
             else
                 echo "⚠️ Warning: Native WARP API registration failed. Falling back to legacy daemon..."
@@ -361,70 +393,117 @@ if [ ! -d "/usr/local/x-ui" ]; then
 fi
 
 # 12. Enforce strict localhost isolation & apply hardened Xray routing template
-DB_PATH="/etc/x-ui/x-ui.db"
-TEMPLATE_FILE="$SCRIPT_DIR/xray_template_config.json"
+HOST_IP=$(curl -s4m 3 https://api.ipify.org 2>/dev/null || curl -s4m 3 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || true)
+[ -z "$HOST_IP" ] && HOST_IP="YOUR_SERVER_IP"
+SUB_PUBLIC_IP_VAL=""
+if [ "$HOST_IP" != "YOUR_SERVER_IP" ]; then
+    SUB_PUBLIC_IP_VAL="$HOST_IP"
+fi
 
 # Stop x-ui to safely update database settings and prevent race conditions
 systemctl stop x-ui || true
 
 if [ -f "$DB_PATH" ]; then
     echo "🔒 Hardening 3X-UI panel: Binding strictly to 127.0.0.1:23600 (accessible only via SSH tunnel)..."
-    HOST_IP=$(curl -s4m 3 https://api.ipify.org 2>/dev/null || curl -s4m 3 https://ifconfig.me 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')
-    [ -z "$HOST_IP" ] && HOST_IP="YOUR_SERVER_IP"
+    echo "⚙️ Configuring hardened Xray Core split-routing in 3X-UI database (parameterized SQLite)..."
+    python3 - "$DB_PATH" "$HOST_IP" "$APPLIED_TEMPLATE" "$WARP_SUCCESS" "$NATIVE_WARP" << 'PY_SQL_EOF'
+import json
+import os
+import sqlite3
+import sys
 
-    sqlite3 "$DB_PATH" << SQL_EOF
-INSERT INTO settings (key, value) VALUES ('webListen', '127.0.0.1')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+db_path, host_ip, applied_template, warp_success, native_warp = sys.argv[1:6]
+use_native_wg = (warp_success == "true" and native_warp == "true" and os.path.exists("/etc/x-ui/warp_wireguard.json"))
 
-INSERT INTO settings (key, value) VALUES ('webPort', '23600')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+ai_domains = [
+    "geosite:openai", "geosite:anthropic", "geosite:perplexity",
+    "domain:openai.com", "domain:chatgpt.com", "domain:oaistatic.com",
+    "domain:oaiusercontent.com", "domain:sora.com", "domain:ai.com",
+    "domain:chat.openai.com", "domain:auth0.openai.com",
+    "domain:client-api.arkoselabs.com", "domain:featuregates.org",
+    "domain:statsig.com", "domain:statsigapi.net",
+    "domain:anthropic.com", "domain:claude.ai", "domain:claude.com",
+    "domain:cursor.sh", "domain:cursor.com", "domain:cursor-cdn.com",
+    "domain:copilot.microsoft.com", "domain:perplexity.ai",
+    "domain:midjourney.com", "domain:x.ai", "domain:grok.com",
+    "domain:deepseek.com", "domain:mistral.ai", "domain:cohere.com",
+]
 
-INSERT INTO settings (key, value) VALUES ('webBasePath', '/web_secret_path/')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+if os.path.exists(applied_template):
+    with open(applied_template, "r", encoding="utf-8") as f:
+        tpl = json.load(f)
+else:
+    tpl = {
+        "api": {"tag": "api", "services": ["HandlerService", "LoggerService", "StatsService", "RoutingService"]},
+        "stats": {},
+        "policy": {
+            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
+            "system": {
+                "statsInboundUplink": True, "statsInboundDownlink": True,
+                "statsOutboundUplink": True, "statsOutboundDownlink": True,
+            },
+        },
+        "inbounds": [{"tag": "api", "listen": "127.0.0.1", "port": 62789, "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}}],
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}, "streamSettings": {"sockopt": {"tcpKeepAliveIdle": 20, "tcpKeepAliveInterval": 5, "tcpNoDelay": True}}},
+            {"tag": "warp-socks", "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": 40000}]}},
+            {"tag": "blocked", "protocol": "blackhole", "settings": {"response": {"type": "http"}}},
+        ],
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": [
+                {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+                {"type": "field", "outboundTag": "blocked", "protocol": ["bittorrent"]},
+                {"type": "field", "outboundTag": "blocked", "ip": ["geoip:private"]},
+                {"type": "field", "outboundTag": "blocked", "domain": ["geosite:category-ads-all"]},
+                {"type": "field", "outboundTag": "blocked", "port": "443", "network": "udp", "domain": ai_domains},
+                {"type": "field", "outboundTag": "warp-socks", "domain": ai_domains},
+                {"type": "field", "outboundTag": "direct", "network": "tcp,udp"},
+            ],
+        },
+        "dns": {"servers": ["1.1.1.1", "8.8.8.8", "1.0.0.1", "localhost"], "queryStrategy": "UseIPv4"},
+    }
 
-INSERT INTO settings (key, value) VALUES ('subListen', '127.0.0.1')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+if not use_native_wg:
+    tpl["outbounds"] = [
+        o for o in tpl.get("outbounds", [])
+        if not (o.get("tag") == "warp-wireguard" and o.get("settings", {}).get("secretKey") == "GENERATE_VIA_WARP_API")
+    ]
 
-INSERT INTO settings (key, value) VALUES ('subPort', '2095')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+routing_json = json.dumps(tpl, indent=2)
+settings_pairs = [
+    ("webListen", "127.0.0.1"),
+    ("webPort", "23600"),
+    ("webBasePath", "/web_secret_path/"),
+    ("subListen", "127.0.0.1"),
+    ("subPort", "2095"),
+    ("subEnable", "true"),
+    ("subPath", "/sub/"),
+    ("subURI", f"http://{host_ip}:2096/sub/"),
+    ("subJsonPath", "/json_sub/"),
+    ("subJsonURI", f"http://{host_ip}:2096/json_sub/"),
+    ("subJsonEnable", "true"),
+    ("xrayTemplateConfig", routing_json),
+]
 
-INSERT INTO settings (key, value) VALUES ('subEnable', 'true')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-
-INSERT INTO settings (key, value) VALUES ('subPath', '/sub/')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-
-INSERT INTO settings (key, value) VALUES ('subURI', 'http://${HOST_IP}:2096/sub/')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-
-INSERT INTO settings (key, value) VALUES ('subJsonPath', '/json_sub/')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-
-INSERT INTO settings (key, value) VALUES ('subJsonURI', 'http://${HOST_IP}:2096/json_sub/')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-
-INSERT INTO settings (key, value) VALUES ('subJsonEnable', 'true')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-SQL_EOF
-    echo "✅ 3X-UI panel and subscription server configured with public gateway routing."
-
-    echo "⚙️ Configuring hardened Xray Core split-routing in 3X-UI database..."
-    if [ -f "$TEMPLATE_FILE" ]; then
-        ROUTING_JSON=$(cat "$TEMPLATE_FILE")
-    else
-        # Embedded fallback routing template (Full with api, stats, dokodemo-door, bittorrent, and AI QUIC block)
-        ROUTING_JSON='{"api":{"tag":"api","services":["HandlerService","LoggerService","StatsService","RoutingService"]},"stats":{},"policy":{"levels":{"0":{"statsUserUplink":true,"statsUserDownlink":true}},"system":{"statsInboundUplink":true,"statsInboundDownlink":true,"statsOutboundUplink":true,"statsOutboundDownlink":true}},"inbounds":[{"tag":"api","listen":"127.0.0.1","port":62789,"protocol":"dokodemo-door","settings":{"address":"127.0.0.1"}}],"outbounds":[{"tag":"direct","protocol":"freedom","settings":{"domainStrategy":"UseIPv4"},"streamSettings":{"sockopt":{"tcpKeepAliveIdle":20,"tcpKeepAliveInterval":5}}},{"tag":"warp-socks","protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":40000}]}},{"tag":"blocked","protocol":"blackhole","settings":{"response":{"type":"http"}}}],"routing":{"domainStrategy":"IPIfNonMatch","rules":[{"type":"field","inboundTag":["api"],"outboundTag":"api"},{"type":"field","outboundTag":"blocked","protocol":["bittorrent"]},{"type":"field","outboundTag":"blocked","ip":["geoip:private"]},{"type":"field","outboundTag":"blocked","domain":["geosite:category-ads-all"]},{"type":"field","outboundTag":"blocked","port":"443","network":"udp","domain":["geosite:openai","geosite:anthropic","geosite:perplexity","domain:openai.com","domain:chatgpt.com","domain:anthropic.com","domain:claude.ai","domain:perplexity.ai"]},{"type":"field","outboundTag":"warp-socks","domain":["geosite:openai","geosite:anthropic","geosite:perplexity","domain:openai.com","domain:chatgpt.com","domain:oaistatic.com","domain:oaiusercontent.com","domain:sora.com","domain:ai.com","domain:chat.openai.com","domain:auth0.openai.com","domain:client-api.arkoselabs.com","domain:featuregates.org","domain:statsig.com","domain:statsigapi.net","domain:anthropic.com","domain:claude.ai","domain:claude.com","domain:cursor.sh","domain:cursor.com","domain:cursor-cdn.com","domain:copilot.microsoft.com","domain:perplexity.ai","domain:midjourney.com","domain:x.ai","domain:grok.com","domain:deepseek.com","domain:mistral.ai","domain:cohere.com"]},{"type":"field","outboundTag":"direct","network":"tcp,udp"}]},"dns":{"servers":["1.1.1.1","8.8.8.8","1.0.0.1","localhost"],"queryStrategy":"UseIPv4"}}'
-    fi
-
-    # Update or insert xrayTemplateConfig in SQLite settings table
-    sqlite3 "$DB_PATH" << SQL_EOF
-INSERT INTO settings (key, value) VALUES ('xrayTemplateConfig', '$ROUTING_JSON')
-ON CONFLICT(key) DO UPDATE SET value=excluded.value;
-SQL_EOF
+conn = sqlite3.connect(db_path, timeout=10.0)
+try:
+    cur = conn.cursor()
+    for key, val in settings_pairs:
+        cur.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, val),
+        )
+    conn.commit()
+finally:
+    conn.close()
+PY_SQL_EOF
+    echo "✅ 3X-UI panel, subscription server, and hardened Xray routing configured."
 
     # Start x-ui to load the updated isolated settings and routing template
     systemctl start x-ui || true
-    echo "✅ Hardened Xray routing applied and x-ui service restarted."
+    echo "✅ x-ui service started with hardened configuration."
 fi
 
 # 13. Deploy Sub-Enhancer background daemon
@@ -441,30 +520,93 @@ if [ -f "$SCRIPT_DIR/sub-enhancer.py" ]; then
 else
     cat << 'EOF' > "$TARGET_ENHANCER"
 #!/usr/bin/env python3
-import sys, os, re, ssl, sqlite3, base64, urllib.request, urllib.parse
+"""
+Subscription Gateway & Node Transformer (Sub-Enhancer)
+Hardened reverse proxy for 3X-UI subscription endpoints:
+- Injects descriptive node titles from the hosts table (Cellular / Wi-Fi / CDN).
+- Normalizes URL typos, trailing slashes, and redundant delimiters.
+- Adds client refresh intervals (Profile-Update-Interval: 12) and strict security headers.
+- Normalizes spiderX percent-encoding and Reality Vision TCP parameters.
+- Configures SOTA XHTTP URL-encoded JSON `extra` (xPaddingBytes + xmux) parameters.
+- Normalizes both Xray [...] and Sing-box {...} JSON subscriptions & Direct-IP endpoints.
+- Supports non-blocking worker-thread Dual HTTP/HTTPS (MSG_PEEK 0x16) on shared ports.
+"""
+
+import sys
+import os
+import re
+import ssl
+import json
+import socket
+import sqlite3
+import base64
+import ipaddress
+import threading
+import urllib.error
+import urllib.request
+import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 UPSTREAM = os.environ.get("SUB_UPSTREAM", "http://127.0.0.1:2095")
 DB_PATH = os.environ.get("XUI_DB_PATH", "/etc/x-ui/x-ui.db")
-SUB_LISTEN = os.environ.get("SUB_LISTEN", "127.0.0.1")
+SUB_LISTEN = os.environ.get("SUB_LISTEN", "0.0.0.0")
 SSL_CERT = os.environ.get("SUB_SSL_CERT", "/etc/x-ui/sub_cert.pem")
 SSL_KEY = os.environ.get("SUB_SSL_KEY", "/etc/x-ui/sub_key.pem")
+SUB_PUBLIC_IP = os.environ.get("SUB_PUBLIC_IP", "").strip()
 
-def get_sni_remarks():
+DEFAULT_XHTTP_EXTRA_OBJ = {
+    "xPaddingBytes": "100-1000",
+    "xmux": {
+        "maxConcurrency": "16-32",
+        "cMaxReuseTimes": "64-128",
+        "hMaxRequestTimes": "600-800",
+        "hMaxReusableSecs": "1800-2400",
+        "hKeepAlivePeriod": 30,
+    },
+}
+DEFAULT_XHTTP_EXTRA = urllib.parse.quote(
+    json.dumps(DEFAULT_XHTTP_EXTRA_OBJ, separators=(",", ":")), safe=""
+)
+
+STRIPPED_RESPONSE_HEADERS = frozenset({
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "profile-update-interval",
+    "server",
+    "x-powered-by",
+    "cache-control",
+    "x-content-type-options",
+})
+
+
+def get_host_mappings():
+    """Retrieve mapping dictionaries from 3X-UI SQLite database."""
     if not os.path.exists(DB_PATH):
-        return {}
+        return {}, {}
     try:
         conn = sqlite3.connect(DB_PATH, timeout=2.0)
         cur = conn.cursor()
         rows = cur.execute(
-            "SELECT sni, remark FROM hosts WHERE is_disabled=0 AND remark IS NOT NULL AND remark != ''"
+            "SELECT remark, server_description, sni FROM hosts "
+            "WHERE is_disabled=0 AND remark IS NOT NULL AND remark != ''"
         ).fetchall()
         conn.close()
-        return {sni.strip(): remark.strip() for sni, remark in rows if sni and sni.strip()}
-    except Exception:
-        return {}
+        desc_map = {}
+        sni_map = {}
+        for remark, desc, sni in rows:
+            if desc and desc.strip():
+                desc_map[desc.strip()] = remark.strip()
+            if sni and sni.strip() and sni.strip() not in sni_map:
+                sni_map[sni.strip()] = remark.strip()
+        return desc_map, sni_map
+    except Exception as err:
+        sys.stderr.write(f"DB mapping error: {err}\n")
+        return {}, {}
+
 
 def normalize_request_path(raw_path):
+    """Normalize client URL typos, redundant slashes, and whitespace."""
     parsed = urllib.parse.urlsplit(raw_path)
     clean_path = re.sub(r"/+", "/", parsed.path).strip()
     if not clean_path.startswith("/"):
@@ -473,145 +615,516 @@ def normalize_request_path(raw_path):
         return f"{clean_path}?{parsed.query}"
     return clean_path
 
+
+def parse_desc_match(fragment, desc_map):
+    """Attempt decoding base64 serverDescription from URL fragment."""
+    frag_match = re.search(r"serverDescription=([A-Za-z0-9+/=]+)", fragment)
+    if not frag_match:
+        return ""
+    try:
+        decoded = base64.b64decode(frag_match.group(1)).decode("utf-8").strip()
+        return desc_map.get(decoded, "")
+    except Exception as err:
+        sys.stderr.write(f"Desc match error: {err}\n")
+        return ""
+
+
+def resolve_node_title(fragment, sni, desc_map, sni_map):
+    """Resolve descriptive remark title for a VLESS node."""
+    title = parse_desc_match(fragment, desc_map)
+    if title:
+        return title
+
+    unquoted_frag = urllib.parse.unquote(fragment).strip()
+    if unquoted_frag and "serverDescription=" not in unquoted_frag:
+        return unquoted_frag.split("|")[0].split("?")[0].strip()
+
+    if sni and sni in sni_map:
+        return sni_map[sni]
+
+    return f"Node ({sni})" if sni else "Gateway Node"
+
+
+def format_uri_host(host):
+    """Format host for URI authority (bracketing bare IPv6 literals)."""
+    bare = host.strip().strip("[]")
+    if ":" in bare:
+        return f"[{bare}]"
+    return bare
+
+
+def _is_ip_or_local(host):
+    """Return True if host is localhost or a literal IPv4/IPv6 address."""
+    bare = host.strip().strip("[]")
+    if bare.lower() in ("localhost", ""):
+        return True
+    try:
+        ipaddress.ip_address(bare)
+        return True
+    except ValueError:
+        return False
+
+
+def _clean_query_delimiters(url):
+    """Ensure clean single '?' before query parameters and no duplicate '&'."""
+    if "?" in url:
+        base, query = url.split("?", 1)
+        query = query.replace("?", "&")
+    elif "&" in url:
+        base, query = url.split("&", 1)
+    else:
+        return url
+    parts = [p for p in query.split("&") if p]
+    return f"{base}?{'&'.join(parts)}" if parts else base
+
+
+def rewrite_vless_endpoint(main_part, public_host, connect_ip=""):
+    """Rewrite localhost endpoints and apply SOTA Direct-IP SNI preservation."""
+    if public_host:
+        uri_pub = format_uri_host(public_host)
+        main_part = re.sub(
+            r"@(?:localhost|127\.0\.0\.1|\[::1\]):",
+            f"@{uri_pub}:",
+            main_part,
+        )
+
+    if not connect_ip:
+        return main_part
+
+    match = re.search(r"@(\[[0-9a-fA-F:]+\]|[^/?#:]+):(\d+)", main_part)
+    if not match:
+        return main_part
+
+    orig_host, port = match.group(1), match.group(2)
+    uri_ip = format_uri_host(connect_ip)
+    main_part = main_part[:match.start()] + f"@{uri_ip}:{port}" + main_part[match.end():]
+
+    if not _is_ip_or_local(orig_host):
+        encoded_orig = urllib.parse.quote(orig_host, safe="")
+        if "sni=" not in main_part:
+            main_part += f"&sni={encoded_orig}"
+        is_http_transport = any(t in main_part for t in ("type=xhttp", "type=ws", "type=httpupgrade"))
+        if is_http_transport and "host=" not in main_part:
+            main_part += f"&host={encoded_orig}"
+
+    return _clean_query_delimiters(main_part)
+
+
+def _is_xhttp_node(main_part):
+    """Return True if VLESS URI uses XHTTP transport."""
+    return "type=xhttp" in main_part or "net=xhttp" in main_part
+
+
+def _merge_xhttp_extra(main_part):
+    """Ensure XHTTP extra JSON contains xPaddingBytes and xmux ranges (merging 3X-UI mode stubs)."""
+    match = re.search(r"([?&])extra=([^&]*)", main_part)
+    if not match:
+        return main_part + f"&extra={DEFAULT_XHTTP_EXTRA}"
+
+    raw_val = urllib.parse.unquote(match.group(2))
+    try:
+        parsed = json.loads(raw_val) if raw_val else {}
+    except ValueError:
+        return main_part
+
+    if not isinstance(parsed, dict):
+        return main_part
+
+    merged = dict(parsed)
+    changed = False
+    for key in ("xPaddingBytes", "xmux"):
+        if key not in merged:
+            merged[key] = DEFAULT_XHTTP_EXTRA_OBJ[key]
+            changed = True
+
+    if not changed:
+        return main_part
+
+    encoded = urllib.parse.quote(json.dumps(merged, separators=(",", ":")), safe="")
+    return f"{main_part[:match.start()]}{match.group(1)}extra={encoded}{main_part[match.end():]}"
+
+
+def normalize_reality_node(main_part):
+    """Apply strict hardening for Reality nodes (XHTTP SOTA and legacy TCP Vision)."""
+    main_part = re.sub(r"[?&]support-x25519mlkem768=[^&]*", "", main_part)
+    main_part = re.sub(r"[?&]spx=[^&]*", "&spx=%2F", main_part)
+
+    if _is_xhttp_node(main_part):
+        main_part = re.sub(r"[?&](?:flow|xmux|maxConcurrency)=[^&]*", "", main_part)
+        if "mode=" not in main_part:
+            main_part += "&mode=auto"
+        if "path=" not in main_part:
+            main_part += "&path=%2Fapi%2Fv2%2Fsync"
+        main_part = _merge_xhttp_extra(main_part)
+    else:
+        main_part = re.sub(r"[?&]type=[^&]+", "&type=tcp", main_part)
+        main_part = re.sub(r"[?&](?:xmux|maxConcurrency|mode|extra)=[^&]*", "", main_part)
+        if "flow=" in main_part:
+            main_part = re.sub(r"flow=[^&]+", "flow=xtls-rprx-vision", main_part)
+        else:
+            main_part += "&flow=xtls-rprx-vision"
+
+    if "fp=" not in main_part:
+        main_part += "&fp=chrome"
+
+    return _clean_query_delimiters(main_part)
+
+
+def normalize_tls_node(main_part):
+    """Normalize Direct TLS / XHTTP nodes."""
+    if _is_xhttp_node(main_part):
+        main_part = re.sub(r"[?&](?:flow|xmux|maxConcurrency)=[^&]*", "", main_part)
+        if "mode=" not in main_part:
+            main_part += "&mode=auto"
+        main_part = _merge_xhttp_extra(main_part)
+
+    if "fp=" not in main_part:
+        main_part += "&fp=chrome"
+
+    return _clean_query_delimiters(main_part)
+
+
+def _resolve_connect_ip(connect_ip):
+    """Resolve optional SUB_CONNECT_IP override when not explicitly passed."""
+    if connect_ip is None:
+        return os.environ.get("SUB_CONNECT_IP", "").strip()
+    return connect_ip.strip()
+
+
+def process_vless_line(line, sub_host, desc_map, sni_map, connect_ip=None):
+    """Process and normalize a single VLESS line."""
+    if not line.startswith("vless://"):
+        return line
+
+    effective_connect = _resolve_connect_ip(connect_ip)
+    main_part, _, fragment = line.partition("#")
+    main_part = rewrite_vless_endpoint(main_part, sub_host, effective_connect)
+
+    if "security=reality" in main_part:
+        main_part = normalize_reality_node(main_part)
+    elif "security=tls" in main_part:
+        main_part = normalize_tls_node(main_part)
+    else:
+        main_part = _clean_query_delimiters(main_part)
+
+    parsed = urllib.parse.urlsplit(main_part)
+    query = urllib.parse.parse_qs(parsed.query)
+    sni = query.get("sni", [""])[0].strip()
+
+    title = resolve_node_title(fragment, sni, desc_map, sni_map)
+    return f"{main_part}#{urllib.parse.quote(title)}"
+
+
+def transform_base64_payload(body, sub_host, desc_map, sni_map, connect_ip=None):
+    """Decode, process and re-encode base64 subscription payload."""
+    padded = body.strip()
+    padding_needed = (-len(padded)) % 4
+    if padding_needed:
+        padded += b"=" * padding_needed
+
+    try:
+        decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+    except Exception as err:
+        sys.stderr.write(f"B64 decode error: {err}\n")
+        return body
+
+    if "vless://" not in decoded:
+        return body
+
+    seen = set()
+    new_lines = []
+    for line in decoded.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        cleaned = process_vless_line(line, sub_host, desc_map, sni_map, connect_ip=connect_ip)
+        main_url = cleaned.partition("#")[0]
+        if main_url not in seen:
+            seen.add(main_url)
+            new_lines.append(cleaned)
+
+    return base64.b64encode("\n".join(new_lines).encode("utf-8"))
+
+
+def _rewrite_json_host_field(obj, key, bare_public, bare_connect):
+    """Rewrite a single JSON host key ('address' or 'server') in-place."""
+    val = obj.get(key)
+    if not isinstance(val, str):
+        return
+    if val.strip().lower() in ("localhost", "127.0.0.1", "::1", "[::1]") and bare_public:
+        obj[key] = bare_public
+    elif bare_connect and not _is_ip_or_local(val):
+        obj[key] = bare_connect
+
+
+def _rewrite_json_node(obj, bare_public, bare_connect):
+    """Recursively normalize server endpoints across Xray and Sing-box JSON objects."""
+    if isinstance(obj, list):
+        for item in obj:
+            _rewrite_json_node(item, bare_public, bare_connect)
+        return
+    if not isinstance(obj, dict):
+        return
+
+    if "server" in obj and ("type" in obj or "server_port" in obj):
+        _rewrite_json_host_field(obj, "server", bare_public, bare_connect)
+    if "address" in obj and ("port" in obj or "users" in obj):
+        _rewrite_json_host_field(obj, "address", bare_public, bare_connect)
+
+    for key, val in obj.items():
+        if key not in ("dns", "inbounds"):
+            _rewrite_json_node(val, bare_public, bare_connect)
+
+
+def transform_json_payload(body, sub_host, connect_ip=None):
+    """Normalize addresses in Xray [...] and Sing-box {...} JSON subscription payloads."""
+    effective_connect = _resolve_connect_ip(connect_ip)
+    bare_public = (effective_connect or sub_host or "").strip().strip("[]")
+    bare_connect = effective_connect.strip("[]")
+    if not bare_public and not bare_connect:
+        return body
+
+    try:
+        raw_text = body.decode("utf-8", errors="ignore").strip()
+        if not raw_text or raw_text[0] not in ("[", "{"):
+            return body
+        data = json.loads(raw_text)
+        _rewrite_json_node(data, bare_public, bare_connect)
+        return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    except Exception as err:
+        sys.stderr.write(f"JSON normalize error: {err}\n")
+        return body
+
+
+def _sanitize_header_value(value):
+    """Sanitize header values to Latin-1 without CR/LF/NEL injection."""
+    safe_v = str(value).replace("\r", " ").replace("\n", " ").replace("\x85", " ")
+    try:
+        safe_v.encode("latin-1")
+        return safe_v
+    except UnicodeEncodeError:
+        return safe_v.encode("utf-8", errors="ignore").decode("latin-1", errors="replace")
+
+
 class SubHandler(BaseHTTPRequestHandler):
+    """Hardened reverse proxy HTTP handler for 3X-UI subscription endpoints."""
+
     def log_message(self, format, *args):
-        pass
+        return
+
+    def send_response(self, code, message=None):
+        self.send_response_only(code, message)
+        self.send_header("Date", self.date_time_string())
 
     def do_GET(self):
-        self.proxy_request("GET")
+        self.handle_proxy("GET")
 
     def do_HEAD(self):
-        self.proxy_request("HEAD")
+        self.handle_proxy("HEAD")
 
-    def proxy_request(self, method):
+    def forward_upstream(self, method):
         normalized_path = normalize_request_path(self.path)
         upstream_url = UPSTREAM + normalized_path
-
         req_headers = {
             k: v for k, v in self.headers.items()
             if k.lower() not in ("host", "content-length", "connection")
         }
         req = urllib.request.Request(upstream_url, headers=req_headers, method=method)
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            body = resp.read() if method == "GET" else b""
+            return resp.status, dict(resp.headers), body
 
-        try:
-            with urllib.request.urlopen(req, timeout=8.0) as resp:
-                status = resp.status
-                headers = dict(resp.headers)
-                body = resp.read() if method == "GET" else b""
-        except urllib.error.HTTPError as e:
-            self.send_response(e.code)
-            for k, v in e.headers.items():
-                if k.lower() not in ("content-length", "transfer-encoding", "connection"):
-                    self.send_header(k, v)
-            body = e.read()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            if method == "GET":
-                self.wfile.write(body)
-            return
-        except Exception as e:
-            self.send_response(502)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            msg = f"Bad Gateway: {e}".encode("utf-8")
-            self.send_header("Content-Length", str(len(msg)))
-            self.end_headers()
-            if method == "GET":
-                self.wfile.write(msg)
-            return
-
-        if status == 200 and method == "GET" and body:
-            try:
-                padded_body = body.strip()
-                padding_needed = (-len(padded_body)) % 4
-                if padding_needed:
-                    padded_body += b"=" * padding_needed
-
-                decoded = base64.b64decode(padded_body).decode("utf-8", errors="ignore")
-                if "vless://" in decoded:
-                    sni_map = get_sni_remarks()
-                    lines = decoded.strip().splitlines()
-                    new_lines = []
-                    for line in lines:
-                        line = line.strip()
-                        if line.startswith("vless://"):
-                            main_part, _, _ = line.partition("#")
-                            parsed = urllib.parse.urlsplit(main_part)
-                            query = urllib.parse.parse_qs(parsed.query)
-                            sni = query.get("sni", [""])[0].strip()
-                            title = sni_map.get(sni)
-                            if not title:
-                                title = f"Node ({sni})" if sni else "Golden Standard Proxy"
-                            new_lines.append(f"{main_part}#{urllib.parse.quote(title)}")
-                        elif line:
-                            new_lines.append(line)
-                    body = base64.b64encode("\n".join(new_lines).encode("utf-8"))
-            except Exception:
-                pass
-
-        self.send_response(status)
-        for k, v in headers.items():
-            if k.lower() in ("content-length", "transfer-encoding", "connection", "profile-update-interval"):
-                continue
-            safe_v = str(v).replace("\r", " ").replace("\n", " ").replace("\x85", " ")
-            try:
-                safe_v.encode("latin-1")
-            except UnicodeEncodeError:
-                safe_v = safe_v.encode("utf-8", errors="ignore").decode("latin-1", errors="replace")
-            self.send_header(k, safe_v)
-        self.send_header("Profile-Update-Interval", "12")
+    def _send_security_headers(self):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, private")
         self.send_header("X-Content-Type-Options", "nosniff")
+
+    def _forward_filtered_headers(self, headers):
+        for k, v in headers.items():
+            if k.lower() in STRIPPED_RESPONSE_HEADERS:
+                continue
+            self.send_header(k, _sanitize_header_value(v))
+
+    def send_error_response(self, code, msg, method="GET"):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self._send_security_headers()
+        raw_msg = msg.encode("utf-8")
+        self.send_header("Content-Length", str(len(raw_msg)))
+        self.end_headers()
+        if method != "HEAD" and raw_msg:
+            self.wfile.write(raw_msg)
+
+    def send_upstream_error(self, err, method="GET"):
+        try:
+            self.send_response(err.code)
+            self._forward_filtered_headers(err.headers)
+            self._send_security_headers()
+            err_body = err.read() if method != "HEAD" else b""
+        finally:
+            err.close()
+        self.send_header("Content-Length", str(len(err_body)))
+        self.end_headers()
+        if method != "HEAD" and err_body:
+            self.wfile.write(err_body)
+
+    def send_transformed_response(self, status, headers, body, method):
+        self.send_response(status)
+        self._forward_filtered_headers(headers)
+        self.send_header("Profile-Update-Interval", "12")
+        self._send_security_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if method == "GET" and body:
             self.wfile.write(body)
 
+    def handle_proxy(self, method):
+        try:
+            status, headers, body = self.forward_upstream(method)
+        except urllib.error.HTTPError as err:
+            self.send_upstream_error(err, method=method)
+            return
+        except Exception as err:
+            self.send_error_response(502, f"Bad Gateway (Upstream 3X-UI unreachable): {err}", method=method)
+            return
+
+        if status == 200 and method == "GET" and body:
+            connect_ip = os.environ.get("SUB_CONNECT_IP", "").strip()
+            sub_host = (
+                connect_ip
+                or os.environ.get("SUB_PUBLIC_IP", "").strip()
+                or SUB_PUBLIC_IP
+                or os.environ.get("SUB_DOMAIN", "").strip()
+            )
+            desc_map, sni_map = get_host_mappings()
+            stripped_body = body.lstrip()
+            if stripped_body.startswith((b"[", b"{")):
+                body = transform_json_payload(body, sub_host, connect_ip=connect_ip)
+            else:
+                body = transform_base64_payload(body, sub_host, desc_map, sni_map, connect_ip=connect_ip)
+
+        self.send_transformed_response(status, headers, body, method)
+
+
+def _negotiate_dual_socket(sock, ssl_ctx, client_addr):
+    """Peek first byte in worker thread to upgrade TLS connections without blocking accept."""
+    if not ssl_ctx:
+        sock.settimeout(15.0)
+        return sock
+    try:
+        sock.settimeout(3.0)
+        first_byte = sock.recv(1, socket.MSG_PEEK)
+        sock.settimeout(15.0)
+        if first_byte == b"\x16":
+            return ssl_ctx.wrap_socket(sock, server_side=True)
+    except Exception as err:
+        sys.stderr.write(f"TLS wrap notice for {client_addr[0]}: {err} (serving as plain HTTP)\n")
+        try:
+            sock.settimeout(15.0)
+        except OSError as timeout_err:
+            sys.stderr.write(f"Socket settimeout notice: {timeout_err}\n")
+    return sock
+
+
 class DualProtocolServer(ThreadingHTTPServer):
+    """
+    Dual-protocol HTTP and HTTPS server supporting simultaneous plain HTTP and TLS
+    on the same port via non-blocking worker-thread MSG_PEEK 0x16 protocol sniffing.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
     def __init__(self, server_address, RequestHandlerClass, ssl_ctx=None):
         self.ssl_ctx = ssl_ctx
+        max_conn = int(os.environ.get("SUB_MAX_CONCURRENCY", "128"))
+        self._conn_sem = threading.BoundedSemaphore(max(1, max_conn))
         super().__init__(server_address, RequestHandlerClass)
 
     def get_request(self):
         sock, addr = self.socket.accept()
-        if not self.ssl_ctx:
-            sock.settimeout(15.0)
-            return sock, addr
-        try:
-            sock.settimeout(5.0)
-            first_byte = sock.recv(1, socket.MSG_PEEK)
-            sock.settimeout(15.0)
-            if first_byte == b"\x16":
-                sock = self.ssl_ctx.wrap_socket(sock, server_side=True)
-        except Exception as err:
-            sys.stderr.write(f"TLS wrap notice for {addr[0]}: {err} (serving as plain HTTP)\n")
-            try:
-                sock.settimeout(15.0)
-            except OSError:
-                pass
+        sock.settimeout(15.0)
         return sock, addr
+
+    def process_request(self, request, client_address):
+        if not self._conn_sem.acquire(blocking=False):
+            sys.stderr.write(f"Concurrency limit reached; dropping {client_address[0]}\n")
+            self.shutdown_request(request)
+            return
+        thread = threading.Thread(
+            target=self.process_request_thread,
+            args=(request, client_address),
+        )
+        thread.daemon = self.daemon_threads
+        thread.start()
+
+    def process_request_thread(self, request, client_address):
+        try:
+            negotiated = _negotiate_dual_socket(request, self.ssl_ctx, client_address)
+            super().process_request_thread(negotiated, client_address)
+        except Exception as err:
+            sys.stderr.write(f"Worker connection error for {client_address[0]}: {err}\n")
+            self.shutdown_request(request)
+        finally:
+            self._conn_sem.release()
+
+
+def resolve_listen_ports():
+    """Determine gateway listener ports, avoiding port 80 collision in Single-Port-443 mode."""
+    single_port = os.environ.get("SUB_SINGLE_PORT_443", "").strip().lower() in ("true", "1", "yes")
+    raw_env = os.environ.get("SUB_PORTS", "2096,28443,80").strip()
+    if single_port and raw_env == "2096,28443,80":
+        return [2096]
+    ports = [int(item.strip()) for item in raw_env.split(",") if item.strip().isdigit()]
+    return ports or [2096]
+
+
+def load_ssl_context():
+    """Load optional server TLS context when certificates exist and TLS is not disabled."""
+    force_no_tls = os.environ.get("SUB_ENABLE_TLS", "").strip().lower() in ("false", "0", "no")
+    if force_no_tls or not (os.path.exists(SSL_CERT) and os.path.exists(SSL_KEY)):
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=SSL_CERT, keyfile=SSL_KEY)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        print(f"[+] TLS certificates loaded successfully from {SSL_CERT} (Dual HTTP/HTTPS active)")
+        return ctx
+    except Exception as err:
+        print(f"[!] Warning: Failed to load TLS certificates ({err}). Starting in plain HTTP mode.")
+        return None
+
 
 def start_server(listen_ip, port, ssl_ctx=None):
     server = DualProtocolServer((listen_ip, port), SubHandler, ssl_ctx)
+    proto = "Dual (HTTP/HTTPS)" if ssl_ctx else "HTTP (Plain)"
+    print(f"[*] Sub-Enhancer listening on {listen_ip}:{port} ({proto})")
     server.serve_forever()
 
-if __name__ == "__main__":
-    import threading
-    ssl_context = None
-    enable_tls = os.environ.get("SUB_ENABLE_TLS", "false").strip().lower() in ("true", "1", "yes")
-    if enable_tls and os.path.exists(SSL_CERT) and os.path.exists(SSL_KEY):
-        try:
-            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ssl_context.load_cert_chain(certfile=SSL_CERT, keyfile=SSL_KEY)
-            ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-        except Exception:
-            ssl_context = None
 
-    raw_ports = os.environ.get("SUB_PORTS", "2096,28443,80").split(",")
-    ports = [int(p.strip()) for p in raw_ports if p.strip()]
-    for p in ports[:-1]:
-        t = threading.Thread(target=start_server, args=(SUB_LISTEN, p, ssl_context), daemon=True)
+def run_gateway_servers(listen_ip, ports, ssl_ctx=None):
+    """Bind all requested listener ports resiliently and serve concurrently."""
+    servers = []
+    for port in ports:
+        try:
+            srv = DualProtocolServer((listen_ip, port), SubHandler, ssl_ctx)
+            proto = "Dual (HTTP/HTTPS)" if ssl_ctx else "HTTP (Plain)"
+            print(f"[*] Sub-Enhancer listening on {listen_ip}:{port} ({proto})")
+            servers.append(srv)
+        except OSError as err:
+            sys.stderr.write(f"[!] Warning: Could not bind {listen_ip}:{port}: {err}\n")
+
+    if not servers:
+        sys.stderr.write("[!] Fatal: Failed to bind any subscription gateway port.\n")
+        sys.exit(1)
+
+    for srv in servers[:-1]:
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
-    start_server(SUB_LISTEN, ports[-1], ssl_context)
+    servers[-1].serve_forever()
+
+
+if __name__ == "__main__":
+    run_gateway_servers(SUB_LISTEN, resolve_listen_ports(), load_ssl_context())
 EOF
 fi
 chmod +x "$TARGET_ENHANCER"
@@ -619,6 +1132,11 @@ chmod +x "$TARGET_ENHANCER"
 if [ "$SINGLE_PORT_443" = true ]; then
     SUB_ACTUAL_LISTEN="127.0.0.1"
     SUB_SINGLE_PORT_FLAG="true"
+    if [ "$SUB_PORTS" = "2096,28443,80" ]; then
+        EFFECTIVE_SUB_PORTS="2096"
+    else
+        EFFECTIVE_SUB_PORTS="$SUB_PORTS"
+    fi
     echo "🔒 Deploying Next-Gen Nginx Stream SNI Multiplexer on port 443..."
     mkdir -p /etc/nginx/stream.d
     if ! grep -q "stream.d" /etc/nginx/nginx.conf 2>/dev/null; then
@@ -649,6 +1167,7 @@ NGINX_CONF_EOF
 else
     SUB_ACTUAL_LISTEN="0.0.0.0"
     SUB_SINGLE_PORT_FLAG="false"
+    EFFECTIVE_SUB_PORTS="$SUB_PORTS"
 fi
 
 cat << EOF > /etc/systemd/system/sub-enhancer.service
@@ -659,8 +1178,11 @@ After=network.target x-ui.service
 [Service]
 Type=simple
 User=root
-Environment="SUB_PORTS=$SUB_PORTS"
+NoNewPrivileges=true
+PrivateTmp=true
+Environment="SUB_PORTS=$EFFECTIVE_SUB_PORTS"
 Environment="SUB_LISTEN=$SUB_ACTUAL_LISTEN"
+Environment="SUB_PUBLIC_IP=${SUB_PUBLIC_IP_VAL:-}"
 Environment="SUB_SINGLE_PORT_443=$SUB_SINGLE_PORT_FLAG"
 ExecStart=/usr/bin/python3 $TARGET_ENHANCER
 Restart=always
@@ -672,6 +1194,82 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now sub-enhancer
+
+# 13b. Automated Monthly Maintenance Timer (README Section 7.1)
+echo "🕒 Installing automated monthly maintenance timer (vps-maintenance.timer)..."
+cat << 'MAINT_EOF' > /usr/local/bin/vps-monthly-maintenance.sh
+#!/usr/bin/env bash
+set -e
+echo "=== [$(date)] Starting Scheduled Monthly Maintenance ==="
+
+DEFAULT_GW=$(ip route show default 2>/dev/null | awk '{print $3}' | head -n1)
+DEFAULT_DEV=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1)
+if [ -f /etc/x-ui/x-ui.db ] && [ -n "$DEFAULT_GW" ] && [ -n "$DEFAULT_DEV" ]; then
+    REALITY_DEST=$(sqlite3 /etc/x-ui/x-ui.db "SELECT stream_settings FROM inbounds WHERE id=1;" 2>/dev/null | grep -o '"dest": *"[^"]*"' | head -n1 | cut -d'"' -f4)
+    if [ -n "$REALITY_DEST" ]; then
+        DEST_HOST=$(echo "$REALITY_DEST" | cut -d':' -f1)
+        DEST_PORT=$(echo "$REALITY_DEST" | cut -d':' -f2)
+        [ -z "$DEST_PORT" ] && DEST_PORT=443
+        if ! curl -s -I --max-time 3 "https://${DEST_HOST}:${DEST_PORT}" >/dev/null 2>&1; then
+            DEST_IPS=$(getent ahosts "$DEST_HOST" 2>/dev/null | awk '{print $1}' | sort -u)
+            for d_ip in $DEST_IPS; do
+                ip route replace "$d_ip" via "$DEFAULT_GW" dev "$DEFAULT_DEV" 2>/dev/null || true
+            done
+        fi
+    fi
+fi
+
+/usr/bin/x-ui update-all-geofiles || true
+
+systemctl stop x-ui || true
+sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;" || true
+systemctl start x-ui || true
+
+journalctl --vacuum-time=14d --vacuum-size=100M || true
+
+if [ -f /etc/x-ui/warp_wireguard.json ] || sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='xrayTemplateConfig';" 2>/dev/null | grep -q '"warp-wireguard"'; then
+    echo "[OK] Native WireGuard WARP outbound configured in Xray Core (0 MB daemon mode)."
+elif systemctl list-unit-files warp-svc.service 2>/dev/null | grep -q warp-svc && systemctl is-enabled --quiet warp-svc 2>/dev/null; then
+    if ! curl -s -x socks5h://127.0.0.1:40000 --max-time 5 https://www.cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+        systemctl restart warp-svc || true
+        sleep 3
+        warp-cli --accept-tos connect || true
+    fi
+fi
+
+systemctl restart sub-enhancer || true
+systemctl is-active --quiet x-ui || systemctl restart x-ui || true
+echo "=== [$(date)] Monthly Maintenance Completed Successfully ==="
+MAINT_EOF
+chmod 755 /usr/local/bin/vps-monthly-maintenance.sh
+
+cat << 'MAINT_SVC_EOF' > /etc/systemd/system/vps-maintenance.service
+[Unit]
+Description=Automated Monthly VPS Maintenance & Anti-Censorship Sync
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vps-monthly-maintenance.sh
+StandardOutput=journal
+StandardError=journal
+MAINT_SVC_EOF
+
+cat << 'MAINT_TMR_EOF' > /etc/systemd/system/vps-maintenance.timer
+[Unit]
+Description=Timer for Automated Monthly VPS Maintenance
+Requires=vps-maintenance.service
+
+[Timer]
+OnCalendar=*-*-01 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+MAINT_TMR_EOF
+
+systemctl daemon-reload
+systemctl enable --now vps-maintenance.timer || true
 
 # 14. Verification and Health Check Audit
 echo "=========================================================="
@@ -696,7 +1294,7 @@ fi
 
 ENHANCER_STATUS="inactive"
 if systemctl is-active --quiet sub-enhancer; then
-    ENHANCER_STATUS="running (listen: $SUB_ACTUAL_LISTEN:$SUB_PORTS)"
+    ENHANCER_STATUS="running (listen: $SUB_ACTUAL_LISTEN:$EFFECTIVE_SUB_PORTS)"
 fi
 
 echo "  • Virtualization:       $VIRT_TYPE"
